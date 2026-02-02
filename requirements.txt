@@ -1,0 +1,16 @@
+# Local Messenger with File Transfer - Requirements
+
+# Core dependencies (most are built-in)
+# tkinter, socket, json, threading, etc.
+
+# For network interface detection (Linux/Mac)
+netifaces==0.11.0
+
+# For better file operations
+# (Optional) No additional packages needed beyond Python standard library
+
+# For creating executables (optional)
+# pyinstaller==6.8.0
+
+# Install with:
+# pip install netifaces
