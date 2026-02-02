@@ -21,4 +21,4 @@ Open terminal then type the following command:
 **For windows**
  
 If you didn't install packages, that was used on that python script, then 
-launch command prompt then type the command that was in the 2nd method for linux.
+launch command prompt and type the following command that was on the 2nd method for linux.
