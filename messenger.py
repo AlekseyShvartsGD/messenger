@@ -1,1679 +1,1884 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
-from datetime import datetime
-import os
-import platform
-import sys
-import threading
-import time
-import json
-import socket
-import select
+from tkinter import font as tkfont, ttk, messagebox, filedialog
+import datetime
+import random
 import hashlib
-import getpass
-import subprocess
-import base64
-import struct
+import os
+import json
+import time
+import threading
+import socket
+import pickle
 from pathlib import Path
+import shutil
 
-class LocalMessenger:
+class TelegramStyleMessenger:
     def __init__(self):
         self.root = tk.Tk()
-        
-        # Window setup
         self.root.title("Operation")
-        self.root.geometry("550x650")  # Increased size for file transfer
-        self.root.configure(bg='#1a1a1a')
+        self.root.geometry("900x650")
+        self.root.configure(bg='#0f0f0f')
         
-        # User and connection state
-        self.current_user = None
-        self.user_id = None
-        self.user_ip = None
-        self.user_port = 12345
-        self.file_port = 12346  # Separate port for file transfers
+        # User data
+        self.display_name = ""
+        self.username = ""
+        self.phone = ""
+        self.user_id = ""
+        self.is_logged_in = False
+        self.profile_photo = None
+        self.bio = ""
         
-        # Messenger state
-        self.messenger_active = False
-        self.messenger_server = None
-        self.file_server = None
-        self.connected_users = {}  # user_id: socket
-        self.user_directory = {}   # user_id: {"name": "", "ip": "", "last_seen": ""}
+        # Menu state
+        self.menu_visible = False
+        self.menu_window = None
         
-        # File transfer state
-        self.file_transfers = {}  # transfer_id: {type, filename, size, progress, status}
-        self.current_file_transfer_id = 0
+        # Settings state
+        self.night_mode = True
+        self.notifications = True
+        self.auto_download = True
+        self.theme_color = "#4a6da8"
         
-        # Platform-specific paths
-        self.system = platform.system()
+        # Data structures
+        self.chats = []
+        self.contacts = []
+        self.messages = {}  # {chat_id: [messages]}
+        self.current_chat_index = None
+        self.current_chat_id = None
+        self.archived_chats = []
         
-        # Configuration files
-        if self.system == "Windows":
-            self.app_data_dir = os.path.join(os.getenv('APPDATA'), 'LocalMessenger')
-            self.download_dir = os.path.join(os.getenv('USERPROFILE'), 'Downloads', 'Operation')
-        else:  # Linux, macOS, etc.
-            self.app_data_dir = os.path.expanduser("~/.localmessenger")
-            self.download_dir = os.path.expanduser("~/Downloads/Operation")
+        # Network
+        self.server = None
+        self.is_online = False
+        self.online_users = {}
         
-        self.config_file = os.path.join(self.app_data_dir, 'config.json')
-        self.contacts_file = os.path.join(self.app_data_dir, 'contacts.json')
-        
-        # Create app data directory
-        os.makedirs(self.app_data_dir, exist_ok=True)
+        # File paths
+        self.data_dir = os.path.join(os.path.expanduser("~"), ".telegram_clone")
+        self.download_dir = os.path.join(os.path.expanduser("~"), "Downloads", "Telegram")
+        os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.download_dir, exist_ok=True)
         
-        # Load configuration
-        self.load_config()
+        # Load saved data
+        self.load_user_data()
+        self.load_chats()
+        self.load_contacts()
+        self.load_messages()
         
-        # Setup auto-start
-        self.setup_autostart()
+        # Start network services
+        self.start_network_services()
         
-        # If user already exists, start messenger directly
-        if self.current_user and self.user_id:
-            self.start_messenger()
+        # Setup UI
+        if self.is_logged_in:
+            self.setup_main_ui()
         else:
             self.show_login_screen()
     
-    def setup_autostart(self):
-        """Setup auto-start based on platform"""
-        if self.system == "Windows":
-            self.setup_windows_autostart()
-        elif self.system == "Linux":
-            self.setup_linux_autostart()
-        elif self.system == "Darwin":  # macOS
-            self.setup_macos_autostart()
+    # ==================== DATA MANAGEMENT ====================
     
-    def setup_windows_autostart(self):
-        """Add app to Windows startup via Task Scheduler if not exists"""
-        try:
-            import winreg
-            
-            # First, try to check if task already exists in Task Scheduler
-            task_name = "LocalMessengerNotification"
-            check_command = f'schtasks /query /tn "{task_name}"'
-            result = subprocess.run(check_command, shell=True, capture_output=True, text=True)
-            
-            if result.returncode != 0:  # Task doesn't exist
-                # Get the path to the current executable/script
-                if getattr(sys, 'frozen', False):
-                    # Running as executable
-                    app_path = sys.executable
-                else:
-                    # Running as script
-                    app_path = sys.argv[0]
-                    # If it's a script, we need to run it with Python
-                    python_exe = sys.executable
-                    app_path = f'"{python_exe}" "{app_path}"'
-                
-                # Create the task using schtasks command
-                create_command = f'''
-schtasks /create /tn "{task_name}" /tr "{app_path}" /sc onlogon /rl highest /f
-'''
-                subprocess.run(create_command, shell=True, capture_output=True)
-                
-                # Also add to registry as backup
-                try:
-                    key = winreg.OpenKey(
-                        winreg.HKEY_CURRENT_USER,
-                        r"Software\Microsoft\Windows\CurrentVersion\Run",
-                        0, winreg.KEY_SET_VALUE
-                    )
-                    winreg.SetValueEx(key, "LocalMessenger", 0, winreg.REG_SZ, app_path)
-                    winreg.CloseKey(key)
-                except:
-                    pass
-                
-                print("Windows autostart task created successfully")
-            else:
-                print("Windows autostart task already exists")
-                
-        except Exception as e:
-            print(f"Windows autostart setup failed: {e}")
-    
-    def setup_linux_autostart(self):
-        """Add app to Linux startup (systemd user service)"""
-        try:
-            # Create systemd user service directory
-            service_dir = os.path.expanduser(f"~/.config/systemd/user")
-            os.makedirs(service_dir, exist_ok=True)
-            
-            # Get the path to the Python script
-            if getattr(sys, 'frozen', False):
-                # Running as executable
-                script_path = sys.executable
-                exec_start = f'"{script_path}"'
-            else:
-                # Running as script
-                script_path = os.path.abspath(sys.argv[0])
-                exec_start = f'/usr/bin/env python3 "{script_path}"'
-            
-            # Check if service already exists
-            service_file = os.path.join(service_dir, "local-messenger.service")
-            
-            if not os.path.exists(service_file):
-                # Create the service file content
-                service_content = f"""[Unit]
-Description=Local Messenger
-After=network.target graphical-session.target
-
-[Service]
-Type=simple
-ExecStart={exec_start}
-Restart=on-failure
-RestartSec=5
-Environment=DISPLAY=:0
-
-[Install]
-WantedBy=default.target
-"""
-                
-                # Write the service file
-                with open(service_file, 'w') as f:
-                    f.write(service_content)
-                
-                # Enable the service
-                subprocess.run([
-                    "systemctl", "--user", "daemon-reload"
-                ], capture_output=True)
-                
-                subprocess.run([
-                    "systemctl", "--user", "enable", "local-messenger.service"
-                ], capture_output=True)
-                
-                subprocess.run([
-                    "systemctl", "--user", "start", "local-messenger.service"
-                ], capture_output=True)
-                
-                print("Linux systemd service created and started")
-            else:
-                # Service exists, make sure it's running
-                subprocess.run([
-                    "systemctl", "--user", "start", "local-messenger.service"
-                ], capture_output=True)
-                print("Linux systemd service already exists, ensuring it's running")
-            
-            # Also add to desktop autostart (for older DEs)
-            autostart_dir = os.path.expanduser("~/.config/autostart")
-            os.makedirs(autostart_dir, exist_ok=True)
-            
-            desktop_content = f"""[Desktop Entry]
-Type=Application
-Name=Local Messenger
-Exec={exec_start}
-Hidden=false
-NoDisplay=false
-X-GNOME-Autostart-enabled=true
-"""
-            
-            desktop_file = os.path.join(autostart_dir, "local-messenger.desktop")
-            if not os.path.exists(desktop_file):
-                with open(desktop_file, 'w') as f:
-                    f.write(desktop_content)
-                
-                # Make it executable
-                os.chmod(desktop_file, 0o755)
-                print("Linux desktop autostart entry created")
-            
-        except Exception as e:
-            print(f"Linux autostart setup failed: {e}")
-    
-    def setup_macos_autostart(self):
-        """Add app to macOS startup (launchd)"""
-        try:
-            # Get the path to the script/executable
-            if getattr(sys, 'frozen', False):
-                app_path = sys.executable
-            else:
-                app_path = os.path.abspath(sys.argv[0])
-            
-            # Create launch agent directory
-            launch_agent_dir = os.path.expanduser("~/Library/LaunchAgents")
-            os.makedirs(launch_agent_dir, exist_ok=True)
-            
-            # Launch agent plist file path
-            plist_file = os.path.join(launch_agent_dir, "com.local.messenger.plist")
-            
-            if not os.path.exists(plist_file):
-                # Create plist content
-                if getattr(sys, 'frozen', False):
-                    program_args = [app_path]
-                else:
-                    program_args = ["/usr/bin/python3", app_path]
-                
-                plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.local.messenger</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{program_args[0]}</string>
-"""
-                if len(program_args) > 1:
-                    plist_content += f'        <string>{program_args[1]}</string>\n'
-                
-                plist_content += """    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/tmp/localmessenger.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/localmessenger.err</string>
-</dict>
-</plist>"""
-                
-                # Write plist file
-                with open(plist_file, 'w') as f:
-                    f.write(plist_content)
-                
-                # Load the launch agent
-                subprocess.run([
-                    "launchctl", "load", plist_file
-                ], capture_output=True)
-                
-                print("macOS launch agent created and loaded")
-            else:
-                # Ensure it's loaded
-                subprocess.run([
-                    "launchctl", "load", plist_file
-                ], capture_output=True)
-                print("macOS launch agent already exists, ensuring it's loaded")
-            
-        except Exception as e:
-            print(f"macOS autostart setup failed: {e}")
-    
-    def generate_user_id(self, username):
-        """Generate unique user ID based on username and machine"""
-        machine_id = platform.node()  # Computer name
-        timestamp = str(time.time())
-        combined = f"{username}_{machine_id}_{timestamp}"
-        return hashlib.md5(combined.encode()).hexdigest()[:8]  # 8-char user ID
-    
-    def get_local_ip(self):
-        """Get local IP address - cross-platform"""
-        try:
-            if self.system == "Windows":
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-            else:  # Linux/macOS
-                # Try multiple methods for Linux
-                try:
-                    import netifaces
-                    for interface in netifaces.interfaces():
-                        addrs = netifaces.ifaddresses(interface)
-                        if netifaces.AF_INET in addrs:
-                            for addr_info in addrs[netifaces.AF_INET]:
-                                ip = addr_info['addr']
-                                if ip != '127.0.0.1' and not ip.startswith('169.254'):
-                                    return ip
-                except ImportError:
-                    # Fallback method
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.connect(("8.8.8.8", 80))
-                    local_ip = s.getsockname()[0]
-                    s.close()
-            return local_ip
-        except:
-            return "127.0.0.1"
-    
-    def load_config(self):
-        """Load saved configuration"""
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    config = json.load(f)
-                    self.current_user = config.get('username')
-                    self.user_id = config.get('user_id')
-                    self.user_ip = config.get('user_ip')
-                    self.user_port = config.get('port', 12345)
-            
-            if os.path.exists(self.contacts_file):
-                with open(self.contacts_file, 'r') as f:
-                    self.user_directory = json.load(f)
-        except:
-            pass
-    
-    def save_config(self):
-        """Save configuration"""
-        config = {
-            'username': self.current_user,
-            'user_id': self.user_id,
-            'user_ip': self.user_ip,
-            'port': self.user_port
-        }
-        with open(self.config_file, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        # Save contacts
-        with open(self.contacts_file, 'w') as f:
-            json.dump(self.user_directory, f, indent=2)
-    
-    def show_login_screen(self):
-        """Show login/register screen"""
-        self.clear_window()
-        
-        # Title
-        title_label = tk.Label(
-            self.root,
-            text="Operation",
-            font=('Arial', 16, 'bold'),
-            fg='#00BCD4',
-            bg='#1a1a1a'
-        )
-        title_label.pack(pady=(30, 10))
-        
-        # Subtitle
-        subtitle_label = tk.Label(
-            self.root,
-            text="Connect with users on your local network",
-            font=('Arial', 10),
-            fg='#AAAAAA',
-            bg='#1a1a1a'
-        )
-        subtitle_label.pack(pady=(0, 30))
-        
-        # Username entry
-        username_frame = tk.Frame(self.root, bg='#1a1a1a')
-        username_frame.pack(pady=10)
-        
-        tk.Label(
-            username_frame,
-            text="Choose a username:",
-            font=('Arial', 11),
-            fg='white',
-            bg='#1a1a1a'
-        ).pack(side='left', padx=(0, 10))
-        
-        self.username_entry = tk.Entry(
-            username_frame,
-            font=('Arial', 11),
-            width=20,
-            bg='#2a2a2a',
-            fg='white',
-            insertbackground='white'
-        )
-        self.username_entry.pack(side='left')
-        
-        # OS username as suggestion
-        try:
-            os_user = getpass.getuser()
-            self.username_entry.insert(0, os_user)
-        except:
-            pass
-        
-        # Login button
-        login_btn = tk.Button(
-            self.root,
-            text="Start Messaging",
-            font=('Arial', 11, 'bold'),
-            fg='white',
-            bg='#2196F3',
-            command=self.login,
-            width=20,
-            height=2
-        )
-        login_btn.pack(pady=30)
-        
-        # Info
-        info_label = tk.Label(
-            self.root,
-            text=f"• Auto-starts on {self.system} login\n• Share your User ID to connect\n• Works on local network only\n• Send files to contacts",
-            font=('Arial', 9),
-            fg='#666666',
-            bg='#1a1a1a',
-            justify='left'
-        )
-        info_label.pack(pady=20)
-    
-    def login(self):
-        """Login/register user"""
-        username = self.username_entry.get().strip()
-        if not username:
-            return
-        
-        self.current_user = username
-        self.user_id = self.generate_user_id(username)
-        self.user_ip = self.get_local_ip()
-        
-        # Add self to directory
-        self.user_directory[self.user_id] = {
-            "name": self.current_user,
-            "ip": self.user_ip,
-            "last_seen": datetime.now().isoformat(),
-            "is_online": True
-        }
-        
-        # Save config
-        self.save_config()
-        
-        # Start messenger
-        self.start_messenger()
-    
-    def clear_window(self):
-        """Clear all widgets from window"""
-        for widget in self.root.winfo_children():
-            widget.destroy()
-    
-    def start_messenger(self):
-        """Start the messenger interface"""
-        self.clear_window()
-        
-        # Start messenger server
-        self.start_messenger_server()
-        
-        # Start file server
-        self.start_file_server()
-        
-        # Create main interface
-        self.create_messenger_interface()
-        
-        # Start background thread for checking messages
-        self.messenger_active = True
-        threading.Thread(target=self.check_messages, daemon=True).start()
-        threading.Thread(target=self.check_file_transfers, daemon=True).start()
-        
-        # Broadcast presence
-        self.broadcast_presence()
-    
-    def start_messenger_server(self):
-        """Start server to listen for connections"""
-        try:
-            self.messenger_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.messenger_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.messenger_server.bind(('0.0.0.0', self.user_port))
-            self.messenger_server.listen(5)
-            self.messenger_server.setblocking(False)
-        except Exception as e:
-            print(f"Error starting messenger server: {e}")
-    
-    def start_file_server(self):
-        """Start file transfer server"""
-        try:
-            self.file_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.file_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.file_server.bind(('0.0.0.0', self.file_port))
-            self.file_server.listen(5)
-            self.file_server.setblocking(False)
-        except Exception as e:
-            print(f"Error starting file server: {e}")
-    
-    def create_messenger_interface(self):
-        """Create the main messenger interface"""
-        # Top bar
-        top_bar = tk.Frame(self.root, bg='#2a2a2a', height=50)
-        top_bar.pack(fill='x', pady=(0, 5))
-        
-        # User info
-        user_info_frame = tk.Frame(top_bar, bg='#2a2a2a')
-        user_info_frame.pack(side='left', padx=10)
-        
-        tk.Label(
-            user_info_frame,
-            text=f"👤 {self.current_user}",
-            font=('Arial', 11, 'bold'),
-            fg='white',
-            bg='#2a2a2a'
-        ).pack(side='left')
-        
-        # User ID display with copy button
-        id_frame = tk.Frame(top_bar, bg='#2a2a2a')
-        id_frame.pack(side='right', padx=10)
-        
-        tk.Label(
-            id_frame,
-            text="Your ID:",
-            font=('Arial', 9),
-            fg='#AAAAAA',
-            bg='#2a2a2a'
-        ).pack(side='left')
-        
-        id_display = tk.Label(
-            id_frame,
-            text=self.user_id,
-            font=('Arial', 9, 'bold'),
-            fg='#00FF00',
-            bg='#2a2a2a'
-        )
-        id_display.pack(side='left', padx=5)
-        
-        copy_btn = tk.Button(
-            id_frame,
-            text="📋",
-            font=('Arial', 9),
-            fg='white',
-            bg='#555555',
-            command=lambda: self.copy_to_clipboard(self.user_id),
-            width=3
-        )
-        copy_btn.pack(side='left', padx=(5, 0))
-        
-        # Platform indicator
-        platform_frame = tk.Frame(top_bar, bg='#2a2a2a')
-        platform_frame.pack(side='left', padx=10)
-        
-        platform_icon = "🐧" if self.system == "Linux" else "🪟" if self.system == "Windows" else "💻"
-        tk.Label(
-            platform_frame,
-            text=platform_icon,
-            font=('Arial', 12),
-            fg='white',
-            bg='#2a2a2a'
-        ).pack(side='left', padx=5)
-        
-        # SEARCH BAR
-        search_frame = tk.Frame(self.root, bg='#1a1a1a')
-        search_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(
-            search_frame,
-            text="🔍 Search:",
-            font=('Arial', 9),
-            fg='#AAAAAA',
-            bg='#1a1a1a'
-        ).pack(side='left')
-        
-        self.search_entry = tk.Entry(
-            search_frame,
-            font=('Arial', 9),
-            width=25,
-            bg='#2a2a2a',
-            fg='white',
-            insertbackground='white'
-        )
-        self.search_entry.pack(side='left', padx=5)
-        self.search_entry.bind('<KeyRelease>', self.perform_search)
-        
-        clear_search_btn = tk.Button(
-            search_frame,
-            text="Clear",
-            font=('Arial', 9),
-            fg='white',
-            bg='#555555',
-            command=self.clear_search,
-            width=6
-        )
-        clear_search_btn.pack(side='left', padx=5)
-        
-        # File transfer button
-        file_btn = tk.Button(
-            search_frame,
-            text="📁 Send File",
-            font=('Arial', 9),
-            fg='white',
-            bg='#4CAF50',
-            command=self.send_file_dialog,
-            width=10
-        )
-        file_btn.pack(side='left', padx=(10, 0))
-        
-        # Contacts/Connect frame
-        connect_frame = tk.Frame(self.root, bg='#1a1a1a')
-        connect_frame.pack(fill='x', padx=10, pady=5)
-        
-        # Add contact section
-        add_frame = tk.Frame(connect_frame, bg='#1a1a1a')
-        add_frame.pack(fill='x', pady=(0, 5))
-        
-        tk.Label(
-            add_frame,
-            text="Connect to User ID:",
-            font=('Arial', 9),
-            fg='#AAAAAA',
-            bg='#1a1a1a'
-        ).pack(side='left')
-        
-        self.connect_id_entry = tk.Entry(
-            add_frame,
-            font=('Arial', 9),
-            width=12,
-            bg='#2a2a2a',
-            fg='white',
-            insertbackground='white'
-        )
-        self.connect_id_entry.pack(side='left', padx=5)
-        
-        self.connect_btn = tk.Button(
-            add_frame,
-            text="Connect",
-            font=('Arial', 9),
-            fg='white',
-            bg='#2196F3',
-            command=self.connect_to_user,
-            width=8
-        )
-        self.connect_btn.pack(side='left', padx=5)
-        
-        refresh_btn = tk.Button(
-            add_frame,
-            text="🔄 Refresh",
-            font=('Arial', 9),
-            fg='white',
-            bg='#555555',
-            command=self.refresh_contacts,
-            width=10
-        )
-        refresh_btn.pack(side='left', padx=5)
-        
-        # Contacts list
-        contacts_frame = tk.Frame(self.root, bg='#1a1a1a')
-        contacts_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Contacts header with count
-        contacts_header = tk.Frame(contacts_frame, bg='#1a1a1a')
-        contacts_header.pack(fill='x', pady=(0, 5))
-        
-        tk.Label(
-            contacts_header,
-            text="Contacts:",
-            font=('Arial', 10, 'bold'),
-            fg='white',
-            bg='#1a1a1a'
-        ).pack(side='left')
-        
-        self.contacts_count_label = tk.Label(
-            contacts_header,
-            text="",
-            font=('Arial', 9),
-            fg='#666666',
-            bg='#1a1a1a'
-        )
-        self.contacts_count_label.pack(side='left', padx=10)
-        
-        # Contacts listbox with scrollbar
-        listbox_frame = tk.Frame(contacts_frame, bg='#1a1a1a')
-        listbox_frame.pack(fill='both', expand=True)
-        
-        scrollbar = tk.Scrollbar(listbox_frame)
-        scrollbar.pack(side='right', fill='y')
-        
-        self.contacts_listbox = tk.Listbox(
-            listbox_frame,
-            font=('Arial', 10),
-            bg='#2a2a2a',
-            fg='white',
-            selectbackground='#3a3a3a',
-            yscrollcommand=scrollbar.set,
-            height=6
-        )
-        self.contacts_listbox.pack(side='left', fill='both', expand=True)
-        self.contacts_listbox.bind('<<ListboxSelect>>', self.on_contact_select)
-        
-        scrollbar.config(command=self.contacts_listbox.yview)
-        
-        # File transfers frame
-        transfers_frame = tk.Frame(self.root, bg='#1a1a1a')
-        transfers_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(
-            transfers_frame,
-            text="📁 Active Transfers:",
-            font=('Arial', 9, 'bold'),
-            fg='white',
-            bg='#1a1a1a'
-        ).pack(side='left')
-        
-        self.transfers_label = tk.Label(
-            transfers_frame,
-            text="0 active",
-            font=('Arial', 9),
-            fg='#FF8800',
-            bg='#1a1a1a'
-        )
-        self.transfers_label.pack(side='left', padx=10)
-        
-        # Chat area
-        chat_frame = tk.Frame(self.root, bg='#1a1a1a')
-        chat_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Chat display
-        chat_display_frame = tk.Frame(chat_frame, bg='#1a1a1a')
-        chat_display_frame.pack(fill='both', expand=True)
-        
-        scrollbar_chat = tk.Scrollbar(chat_display_frame)
-        scrollbar_chat.pack(side='right', fill='y')
-        
-        self.chat_display = tk.Text(
-            chat_display_frame,
-            font=('Arial', 10),
-            bg='#0a0a0a',
-            fg='white',
-            wrap='word',
-            yscrollcommand=scrollbar_chat.set,
-            state='disabled',
-            height=6
-        )
-        self.chat_display.pack(fill='both', expand=True)
-        
-        scrollbar_chat.config(command=self.chat_display.yview)
-        
-        # Message input
-        input_frame = tk.Frame(chat_frame, bg='#1a1a1a')
-        input_frame.pack(fill='x', pady=(5, 0))
-        
-        self.message_entry = tk.Entry(
-            input_frame,
-            font=('Arial', 10),
-            bg='#2a2a2a',
-            fg='white',
-            insertbackground='white'
-        )
-        self.message_entry.pack(side='left', fill='x', expand=True, padx=(0, 5))
-        self.message_entry.bind('<Return>', self.send_chat_message)
-        
-        # Attach file button
-        attach_btn = tk.Button(
-            input_frame,
-            text="📎",
-            font=('Arial', 12),
-            fg='white',
-            bg='#FF9800',
-            command=self.send_file_to_selected,
-            width=3
-        )
-        attach_btn.pack(side='left', padx=(0, 5))
-        
-        self.send_btn = tk.Button(
-            input_frame,
-            text="Send",
-            font=('Arial', 10, 'bold'),
-            fg='white',
-            bg='#0088cc',
-            command=self.send_chat_message,
-            width=8
-        )
-        self.send_btn.pack(side='right')
-        
-        # Status label
-        self.status_label = tk.Label(
-            self.root,
-            text=f"Ready to chat. Share your User ID: {self.user_id} | Platform: {self.system}",
-            font=('Arial', 8),
-            fg='#FF8800',
-            bg='#1a1a1a'
-        )
-        self.status_label.pack(pady=(0, 5))
-        
-        # Selected contact
-        self.selected_contact_id = None
-        
-        # Update contacts list
-        self.update_contacts_list()
-        
-        # Add welcome message
-        self.add_chat_message("Welcome to Local Messenger!", "system")
-        self.add_chat_message(f"Your User ID: {self.user_id}", "system")
-        self.add_chat_message(f"Platform: {self.system}", "system")
-        self.add_chat_message("Share your ID with others to connect", "system")
-        self.add_chat_message("Click 📎 to send files to selected contact", "system")
-        self.add_chat_message(f"Files are saved to: {self.download_dir}", "system")
-    
-    def send_file_dialog(self):
-        """Open file dialog to send file"""
-        if not self.selected_contact_id:
-            messagebox.showwarning("No Contact Selected", "Please select a contact first.")
-            return
-        
-        filename = filedialog.askopenfilename(
-            title="Select file to send",
-            filetypes=[
-                ("All files", "*.*"),
-                ("Text files", "*.txt"),
-                ("Images", "*.png *.jpg *.jpeg *.gif"),
-                ("Documents", "*.pdf *.doc *.docx *.xls *.xlsx"),
-                ("Videos", "*.mp4 *.avi *.mkv *.mov"),
-                ("Audio", "*.mp3 *.wav *.flac")
-            ]
-        )
-        
-        if filename:
-            self.send_file(self.selected_contact_id, filename)
-    
-    def send_file_to_selected(self):
-        """Send file to selected contact"""
-        if not self.selected_contact_id:
-            self.status_label.config(text="✗ Select a contact first", fg='#FF0000')
-            return
-        self.send_file_dialog()
-    
-    def send_file(self, user_id, filepath):
-        """Send a file to a user"""
-        try:
-            if not os.path.exists(filepath):
-                self.add_chat_message(f"File not found: {filepath}", "system")
-                return
-            
-            filename = os.path.basename(filepath)
-            filesize = os.path.getsize(filepath)
-            
-            if filesize > 100 * 1024 * 1024:  # 100MB limit
-                self.add_chat_message(f"File too large: {filename} ({filesize/1024/1024:.1f}MB)", "system")
-                return
-            
-            # Generate transfer ID
-            transfer_id = self.current_file_transfer_id
-            self.current_file_transfer_id += 1
-            
-            # Add to transfers
-            self.file_transfers[transfer_id] = {
-                'type': 'sending',
-                'filename': filename,
-                'size': filesize,
-                'progress': 0,
-                'status': 'pending',
-                'user_id': user_id,
-                'filepath': filepath
-            }
-            
-            # Update transfers display
-            self.update_transfers_display()
-            
-            # Send file request
-            if user_id in self.connected_users:
-                file_request = json.dumps({
-                    'type': 'file_request',
-                    'from_id': self.user_id,
-                    'from_name': self.current_user,
-                    'filename': filename,
-                    'filesize': filesize,
-                    'transfer_id': transfer_id
-                })
-                self.connected_users[user_id].send(file_request.encode('utf-8'))
-                
-                self.add_chat_message(f"📁 Sending file: {filename} ({filesize/1024/1024:.1f}MB)", "system")
-                self.status_label.config(text=f"📁 Sending file: {filename}", fg='#00FF00')
-                
-                # Start file transfer thread
-                threading.Thread(target=self.send_file_thread, 
-                               args=(user_id, filepath, transfer_id), daemon=True).start()
-            else:
-                self.add_chat_message(f"User not connected", "system")
-                del self.file_transfers[transfer_id]
-                
-        except Exception as e:
-            self.add_chat_message(f"Error sending file: {str(e)}", "system")
-    
-    def send_file_thread(self, user_id, filepath, transfer_id):
-        """Thread for sending file"""
-        try:
-            # Connect to user's file port
-            if user_id not in self.user_directory:
-                self.root.after(0, lambda: self.add_chat_message("User not found", "system"))
-                return
-            
-            user_ip = self.user_directory[user_id]['ip']
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(30)
-            client_socket.connect((user_ip, self.file_port))
-            
-            # Send file metadata
-            filename = os.path.basename(filepath)
-            filesize = os.path.getsize(filepath)
-            
-            metadata = json.dumps({
-                'type': 'file_metadata',
-                'filename': filename,
-                'filesize': filesize,
-                'transfer_id': transfer_id,
-                'sender_id': self.user_id,
-                'sender_name': self.current_user
-            })
-            
-            # Send metadata length first
-            metadata_len = len(metadata)
-            client_socket.send(struct.pack('!I', metadata_len))
-            client_socket.send(metadata.encode('utf-8'))
-            
-            # Wait for acknowledgment
-            ack = client_socket.recv(1024).decode('utf-8')
-            if ack != 'READY':
-                raise Exception("Receiver not ready")
-            
-            # Send file data
-            sent_bytes = 0
-            with open(filepath, 'rb') as f:
-                while True:
-                    chunk = f.read(4096)
-                    if not chunk:
-                        break
-                    client_socket.send(chunk)
-                    sent_bytes += len(chunk)
-                    
-                    # Update progress
-                    progress = (sent_bytes / filesize) * 100
-                    if transfer_id in self.file_transfers:
-                        self.file_transfers[transfer_id]['progress'] = progress
-                        self.root.after(0, self.update_transfers_display)
-            
-            # Wait for completion acknowledgment
-            completion = client_socket.recv(1024).decode('utf-8')
-            if completion == 'COMPLETE':
-                if transfer_id in self.file_transfers:
-                    self.file_transfers[transfer_id]['status'] = 'completed'
-                    self.file_transfers[transfer_id]['progress'] = 100
-                    self.root.after(0, self.update_transfers_display)
-                    self.root.after(0, lambda: self.add_chat_message(f"✓ File sent: {filename}", "system"))
-            else:
-                raise Exception("Transfer failed")
-            
-            client_socket.close()
-            
-        except Exception as e:
-            if transfer_id in self.file_transfers:
-                self.file_transfers[transfer_id]['status'] = 'failed'
-                self.root.after(0, self.update_transfers_display)
-                self.root.after(0, lambda: self.add_chat_message(f"✗ File transfer failed: {str(e)}", "system"))
-    
-    def check_file_transfers(self):
-        """Check for incoming file transfers"""
-        while self.messenger_active and self.file_server:
+    def load_user_data(self):
+        """Load saved user data"""
+        user_file = os.path.join(self.data_dir, "user.json")
+        if os.path.exists(user_file):
             try:
-                readable, _, _ = select.select([self.file_server], [], [], 0.1)
-                
-                for sock in readable:
-                    if sock == self.file_server:
-                        # New file transfer connection
-                        client_socket, addr = self.file_server.accept()
-                        threading.Thread(target=self.handle_file_transfer, 
-                                       args=(client_socket, addr), daemon=True).start()
-                
-            except Exception as e:
-                time.sleep(0.1)
-    
-    def handle_file_transfer(self, sock, addr):
-        """Handle incoming file transfer"""
-        try:
-            sock.settimeout(30)
-            
-            # Receive metadata length
-            metadata_len_data = sock.recv(4)
-            if not metadata_len_data:
-                sock.close()
-                return
-            
-            metadata_len = struct.unpack('!I', metadata_len_data)[0]
-            
-            # Receive metadata
-            metadata = sock.recv(metadata_len).decode('utf-8')
-            metadata_json = json.loads(metadata)
-            
-            filename = metadata_json.get('filename')
-            filesize = metadata_json.get('filesize')
-            transfer_id = metadata_json.get('transfer_id')
-            sender_id = metadata_json.get('sender_id')
-            sender_name = metadata_json.get('sender_name', 'Unknown')
-            
-            # Send ready signal
-            sock.send('READY'.encode('utf-8'))
-            
-            # Create unique filename
-            safe_filename = "".join(c for c in filename if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            unique_filename = f"{timestamp}_{safe_filename}"
-            save_path = os.path.join(self.download_dir, unique_filename)
-            
-            # Create transfer entry
-            if transfer_id not in self.file_transfers:
-                self.file_transfers[transfer_id] = {
-                    'type': 'receiving',
-                    'filename': filename,
-                    'size': filesize,
-                    'progress': 0,
-                    'status': 'downloading',
-                    'user_id': sender_id,
-                    'save_path': save_path
-                }
-                self.root.after(0, self.update_transfers_display)
-            
-            # Receive file data
-            received_bytes = 0
-            with open(save_path, 'wb') as f:
-                while received_bytes < filesize:
-                    chunk = sock.recv(min(4096, filesize - received_bytes))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    received_bytes += len(chunk)
+                with open(user_file, 'r') as f:
+                    data = json.load(f)
+                    self.display_name = data.get('display_name', '')
+                    self.username = data.get('username', '')
+                    self.phone = data.get('phone', '')
+                    self.user_id = data.get('user_id', '')
+                    self.bio = data.get('bio', '')
+                    self.theme_color = data.get('theme_color', '#4a6da8')
+                    self.notifications = data.get('notifications', True)
+                    self.auto_download = data.get('auto_download', True)
+                    self.is_logged_in = True
                     
-                    # Update progress
-                    progress = (received_bytes / filesize) * 100
-                    if transfer_id in self.file_transfers:
-                        self.file_transfers[transfer_id]['progress'] = progress
-                        self.root.after(0, self.update_transfers_display)
-            
-            # Send completion acknowledgment
-            sock.send('COMPLETE'.encode('utf-8'))
-            sock.close()
-            
-            # Update transfer status
-            if transfer_id in self.file_transfers:
-                self.file_transfers[transfer_id]['status'] = 'completed'
-                self.file_transfers[transfer_id]['progress'] = 100
-                self.root.after(0, self.update_transfers_display)
-                
-                # Show notification
-                self.root.after(0, lambda: self.add_chat_message(
-                    f"📁 Received file from {sender_name}: {filename}", "system"))
-                self.root.after(0, lambda: self.status_label.config(
-                    text=f"✓ File received: {filename}", fg='#00FF00'))
-                
-                # Open file location button
-                self.root.after(3000, lambda: self.show_file_received_notification(save_path, filename))
-            
-        except Exception as e:
-            print(f"File transfer error: {e}")
-            if transfer_id in self.file_transfers:
-                self.file_transfers[transfer_id]['status'] = 'failed'
-                self.root.after(0, self.update_transfers_display)
-            try:
-                sock.close()
+                # Load profile photo if exists
+                photo_path = os.path.join(self.data_dir, "profile_photo.png")
+                if os.path.exists(photo_path):
+                    self.profile_photo = photo_path
             except:
                 pass
     
-    def show_file_received_notification(self, filepath, filename):
-        """Show notification for received file"""
-        if hasattr(self, 'status_label'):
-            # Create a frame for the notification
-            notification_frame = tk.Frame(self.root, bg='#2a2a2a', relief='raised', bd=1)
-            notification_frame.place(relx=0.5, rely=0.9, anchor='center')
-            
-            label = tk.Label(
-                notification_frame,
-                text=f"📁 {filename} received",
-                font=('Arial', 9),
-                fg='white',
-                bg='#2a2a2a'
-            )
-            label.pack(side='left', padx=10, pady=5)
-            
-            open_btn = tk.Button(
-                notification_frame,
-                text="Open Folder",
-                font=('Arial', 9),
-                fg='white',
-                bg='#2196F3',
-                command=lambda: self.open_file_location(filepath),
-                width=10
-            )
-            open_btn.pack(side='left', padx=(0, 10), pady=5)
-            
-            # Auto-hide after 10 seconds
-            self.root.after(10000, notification_frame.destroy)
-    
-    def open_file_location(self, filepath):
-        """Open file location in file explorer"""
-        try:
-            if self.system == "Windows":
-                os.startfile(os.path.dirname(filepath))
-            elif self.system == "Darwin":  # macOS
-                subprocess.run(['open', os.path.dirname(filepath)])
-            else:  # Linux
-                subprocess.run(['xdg-open', os.path.dirname(filepath)])
-        except Exception as e:
-            print(f"Error opening file location: {e}")
-    
-    def update_transfers_display(self):
-        """Update file transfers display"""
-        active_count = sum(1 for t in self.file_transfers.values() 
-                          if t['status'] in ['downloading', 'uploading', 'pending'])
-        self.transfers_label.config(text=f"{active_count} active")
-    
-    def perform_search(self, event=None):
-        """Search contacts by username or user ID"""
-        search_term = self.search_entry.get().strip().lower()
-        
-        if not search_term:
-            self.update_contacts_list()
-            return
-        
-        self.contacts_listbox.delete(0, tk.END)
-        found_count = 0
-        
-        for user_id, info in self.user_directory.items():
-            if user_id == self.user_id:
-                continue
-            
-            name = info.get("name", "Unknown").lower()
-            is_online = user_id in self.connected_users
-            
-            if search_term in name or search_term in user_id.lower():
-                status = "🟢" if is_online else "⚫"
-                display_text = f"{status} {info['name']} ({user_id})"
-                
-                self.contacts_listbox.insert(tk.END, display_text)
-                if is_online:
-                    self.contacts_listbox.itemconfig(tk.END, foreground='#00FF00')
-                else:
-                    self.contacts_listbox.itemconfig(tk.END, foreground='#666666')
-                
-                found_count += 1
-        
-        self.contacts_count_label.config(text=f"Found: {found_count}")
-        
-        if found_count == 0 and search_term:
-            self.contacts_listbox.insert(tk.END, "No users found. Try a different search.")
-            self.contacts_listbox.itemconfig(tk.END, foreground='#FF4444')
-    
-    def clear_search(self):
-        """Clear search field and show all contacts"""
-        self.search_entry.delete(0, tk.END)
-        self.update_contacts_list()
-    
-    def update_contacts_list(self):
-        """Update the contacts listbox"""
-        self.contacts_listbox.delete(0, tk.END)
-        
-        online_count = 0
-        offline_count = 0
-        
-        # First show online users
-        for user_id, info in self.user_directory.items():
-            if user_id == self.user_id:
-                continue
-            
-            if user_id in self.connected_users:  # Online
-                name = info.get("name", "Unknown")
-                status = "🟢"
-                display_text = f"{status} {name} ({user_id})"
-                
-                self.contacts_listbox.insert(tk.END, display_text)
-                self.contacts_listbox.itemconfig(tk.END, foreground='#00FF00')
-                online_count += 1
-        
-        # Then show offline users
-        for user_id, info in self.user_directory.items():
-            if user_id == self.user_id:
-                continue
-            
-            if user_id not in self.connected_users:  # Offline
-                name = info.get("name", "Unknown")
-                status = "⚫"
-                display_text = f"{status} {name} ({user_id})"
-                
-                self.contacts_listbox.insert(tk.END, display_text)
-                self.contacts_listbox.itemconfig(tk.END, foreground='#666666')
-                offline_count += 1
-        
-        self.contacts_count_label.config(text=f"Online: {online_count} | Offline: {offline_count}")
-    
-    def copy_to_clipboard(self, text):
-        """Copy text to clipboard"""
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.status_label.config(text="✓ Copied to clipboard!", fg='#00FF00')
-        self.root.after(2000, lambda: self.status_label.config(
-            text=f"Ready to chat. Share your User ID: {self.user_id} | Platform: {self.system}",
-            fg='#FF8800'
-        ))
-    
-    def connect_to_user(self):
-        """Connect to a user by ID"""
-        user_id = self.connect_id_entry.get().strip()
-        if not user_id:
-            self.status_label.config(text="✗ Enter a User ID", fg='#FF0000')
-            return
-        
-        if user_id == self.user_id:
-            self.status_label.config(text="✗ Cannot connect to yourself", fg='#FF0000')
-            return
-        
-        if user_id in self.user_directory:
-            user_info = self.user_directory[user_id]
-            self.try_connect_to_user(user_id, user_info["ip"])
-        else:
-            self.status_label.config(text="✗ User ID not found", fg='#FF0000')
-    
-    def try_connect_to_user(self, user_id, ip):
-        """Try to connect to user"""
-        threading.Thread(target=self.connect_thread, args=(user_id, ip), daemon=True).start()
-    
-    def connect_thread(self, user_id, ip):
-        """Thread for connecting to user"""
-        try:
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(5)
-            client_socket.connect((ip, self.user_port))
-            client_socket.setblocking(False)
-            
-            connect_msg = json.dumps({
-                'type': 'connect',
+    def save_user_data(self):
+        """Save user data"""
+        user_file = os.path.join(self.data_dir, "user.json")
+        with open(user_file, 'w') as f:
+            json.dump({
+                'display_name': self.display_name,
+                'username': self.username,
+                'phone': self.phone,
                 'user_id': self.user_id,
-                'name': self.current_user,
-                'ip': self.user_ip,
-                'file_port': self.file_port
-            })
-            client_socket.send(connect_msg.encode('utf-8'))
-            
-            self.connected_users[user_id] = client_socket
-            
-            if user_id not in self.user_directory:
-                self.user_directory[user_id] = {
-                    "name": "Unknown",
-                    "ip": ip,
-                    "last_seen": datetime.now().isoformat(),
-                    "is_online": True,
-                    "file_port": self.file_port
-                }
-            
-            self.root.after(0, self.status_label.config,
-                          {"text": f"✓ Connected to user", "fg": '#00FF00'})
-            self.root.after(0, self.update_contacts_list)
-            
-        except Exception as e:
-            self.root.after(0, self.status_label.config,
-                          {"text": f"✗ Connection failed: {str(e)}", "fg": '#FF0000'})
+                'bio': self.bio,
+                'theme_color': self.theme_color,
+                'notifications': self.notifications,
+                'auto_download': self.auto_download
+            }, f)
     
-    def on_contact_select(self, event):
-        """Handle contact selection"""
-        selection = self.contacts_listbox.curselection()
-        if not selection:
-            return
-        
-        index = selection[0]
-        item_text = self.contacts_listbox.get(index)
-        
-        if "(" in item_text and ")" in item_text:
-            start = item_text.rfind("(") + 1
-            end = item_text.rfind(")")
-            user_id = item_text[start:end]
-            
-            if user_id in self.user_directory:
-                self.selected_contact_id = user_id
-                user_name = self.user_directory[user_id].get("name", "Unknown")
-                
-                self.chat_display.config(state='normal')
-                self.chat_display.delete('1.0', tk.END)
-                self.chat_display.config(state='disabled')
-                
-                self.add_chat_message(f"Chat with {user_name}", "system")
-                self.add_chat_message(f"Click 📎 to send files", "system")
-                
-                self.message_entry.config(state='normal')
-                self.send_btn.config(state='normal')
-    
-    def add_chat_message(self, message, sender="system"):
-        """Add a message to chat display"""
-        self.chat_display.config(state='normal')
-        
-        if not self.chat_display.tag_names():
-            self.chat_display.tag_config("you", foreground="#0088cc", font=('Arial', 10, 'bold'))
-            self.chat_display.tag_config("other", foreground="#00aa00", font=('Arial', 10, 'bold'))
-            self.chat_display.tag_config("system", foreground="#ff8800", font=('Arial', 10, 'italic'))
-            self.chat_display.tag_config("timestamp", foreground="#666666", font=('Arial', 9))
-            self.chat_display.tag_config("file", foreground="#4CAF50", font=('Arial', 10, 'bold'))
-        
-        timestamp = datetime.now().strftime("%H:%M")
-        
-        if sender == self.current_user or sender == "you":
-            tag = "you"
-            display_sender = "You"
-        elif sender == "system":
-            tag = "system"
-            display_sender = "System"
-        elif sender == "file":
-            tag = "file"
-            display_sender = "File"
-        else:
-            tag = "other"
-            display_sender = sender
-        
-        if sender == "system":
-            self.chat_display.insert('end', f"[{timestamp}] {message}\n", tag)
-        else:
-            self.chat_display.insert('end', f"[{timestamp}] {display_sender}: {message}\n", tag)
-        
-        lines = self.chat_display.get('1.0', 'end').split('\n')
-        if len(lines) > 100:
-            self.chat_display.delete('1.0', f'{len(lines)-100}.0')
-        
-        self.chat_display.config(state='disabled')
-        self.chat_display.see('end')
-    
-    def send_chat_message(self, event=None):
-        """Send chat message to selected contact"""
-        if not self.selected_contact_id:
-            self.status_label.config(text="✗ Select a contact first", fg='#FF0000')
-            return
-        
-        message = self.message_entry.get().strip()
-        if not message:
-            return
-        
-        self.message_entry.delete(0, tk.END)
-        self.add_chat_message(message, "you")
-        
-        if self.selected_contact_id in self.connected_users:
-            self.send_message_to_user(self.selected_contact_id, message)
-        else:
-            self.add_chat_message("Contact is not connected", "system")
-    
-    def send_message_to_user(self, user_id, message):
-        """Send message to specific user"""
-        try:
-            if user_id in self.connected_users:
-                msg_data = json.dumps({
-                    'type': 'message',
-                    'from_id': self.user_id,
-                    'from_name': self.current_user,
-                    'message': message,
-                    'timestamp': datetime.now().isoformat()
-                })
-                self.connected_users[user_id].send(msg_data.encode('utf-8'))
-        except:
-            if user_id in self.connected_users:
-                del self.connected_users[user_id]
-            self.update_contacts_list()
-            self.add_chat_message("Connection lost", "system")
-    
-    def broadcast_presence(self):
-        """Broadcast presence to network"""
-        pass
-    
-    def refresh_contacts(self):
-        """Refresh contacts list"""
-        self.update_contacts_list()
-        self.status_label.config(text="✓ Contacts refreshed", fg='#00FF00')
-        self.root.after(2000, lambda: self.status_label.config(
-            text=f"Ready to chat. Share your User ID: {self.user_id} | Platform: {self.system}",
-            fg='#FF8800'
-        ))
-    
-    def check_messages(self):
-        """Check for incoming messages"""
-        while self.messenger_active:
+    def load_chats(self):
+        """Load saved chats"""
+        chats_file = os.path.join(self.data_dir, "chats.json")
+        if os.path.exists(chats_file):
             try:
-                sockets = [self.messenger_server] + list(self.connected_users.values())
-                readable, _, _ = select.select(sockets, [], [], 0.1)
-                
-                for sock in readable:
-                    if sock == self.messenger_server:
-                        client_socket, addr = self.messenger_server.accept()
-                        client_socket.setblocking(False)
-                        threading.Thread(target=self.handle_new_connection, 
-                                       args=(client_socket, addr), daemon=True).start()
-                    else:
-                        try:
-                            data = sock.recv(4096)
-                            if data:
-                                self.process_incoming_data(data, sock)
-                            else:
-                                self.remove_connection(sock)
-                        except:
-                            self.remove_connection(sock)
-                
-            except Exception as e:
-                time.sleep(0.1)
+                with open(chats_file, 'r') as f:
+                    self.chats = json.load(f)
+            except:
+                self.chats = []
     
-    def handle_new_connection(self, sock, addr):
-        """Handle new incoming connection"""
+    def save_chats(self):
+        """Save chats"""
+        chats_file = os.path.join(self.data_dir, "chats.json")
+        with open(chats_file, 'w') as f:
+            json.dump(self.chats, f)
+    
+    def load_contacts(self):
+        """Load saved contacts"""
+        contacts_file = os.path.join(self.data_dir, "contacts.json")
+        if os.path.exists(contacts_file):
+            try:
+                with open(contacts_file, 'r') as f:
+                    self.contacts = json.load(f)
+            except:
+                self.contacts = []
+    
+    def save_contacts(self):
+        """Save contacts"""
+        contacts_file = os.path.join(self.data_dir, "contacts.json")
+        with open(contacts_file, 'w') as f:
+            json.dump(self.contacts, f)
+    
+    def load_messages(self):
+        """Load saved messages"""
+        messages_file = os.path.join(self.data_dir, "messages.pkl")
+        if os.path.exists(messages_file):
+            try:
+                with open(messages_file, 'rb') as f:
+                    self.messages = pickle.load(f)
+            except:
+                self.messages = {}
+    
+    def save_messages(self):
+        """Save messages"""
+        messages_file = os.path.join(self.data_dir, "messages.pkl")
+        with open(messages_file, 'wb') as f:
+            pickle.dump(self.messages, f)
+    
+    # ==================== NETWORK SERVICES ====================
+    
+    def start_network_services(self):
+        """Start network services for messaging"""
+        def server_thread():
+            self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.server.bind(('0.0.0.0', 8888))
+                self.server.listen(5)
+                self.is_online = True
+                
+                while self.is_online:
+                    client, addr = self.server.accept()
+                    threading.Thread(target=self.handle_client, args=(client, addr)).start()
+            except:
+                pass
+        
+        threading.Thread(target=server_thread, daemon=True).start()
+    
+    def handle_client(self, client, addr):
+        """Handle incoming client connection"""
         try:
-            sock.settimeout(5)
-            data = sock.recv(1024)
-            sock.setblocking(False)
-            
+            data = client.recv(4096)
             if data:
-                self.process_incoming_data(data, sock)
+                message = json.loads(data.decode())
+                msg_type = message.get('type')
+                
+                if msg_type == 'message':
+                    self.receive_message(message)
+                elif msg_type == 'file':
+                    self.receive_file(message, client)
+                elif msg_type == 'typing':
+                    self.show_typing_indicator(message)
+                elif msg_type == 'read':
+                    self.mark_as_read(message)
         except:
-            sock.close()
+            pass
+        finally:
+            client.close()
     
-    def process_incoming_data(self, data, sock):
-        """Process incoming data"""
+    def send_message_network(self, to_user, text):
+        """Send message over network"""
         try:
-            message = json.loads(data.decode('utf-8'))
-            msg_type = message.get('type')
-            
-            if msg_type == 'connect':
-                user_id = message.get('user_id')
-                user_name = message.get('name')
-                user_ip = message.get('ip')
-                file_port = message.get('file_port', self.file_port)
-                
-                self.user_directory[user_id] = {
-                    "name": user_name,
-                    "ip": user_ip,
-                    "last_seen": datetime.now().isoformat(),
-                    "is_online": True,
-                    "file_port": file_port
-                }
-                
-                self.connected_users[user_id] = sock
-                self.save_config()
-                
-                self.root.after(0, self.update_contacts_list)
-                self.root.after(0, self.add_chat_message,
-                              f"{user_name} connected", "system")
-                
-                response = json.dumps({
-                    'type': 'connect_ack',
-                    'user_id': self.user_id,
-                    'name': self.current_user,
-                    'ip': self.user_ip,
-                    'file_port': self.file_port
-                })
-                sock.send(response.encode('utf-8'))
-            
-            elif msg_type == 'connect_ack':
-                user_id = message.get('user_id')
-                user_name = message.get('name')
-                user_ip = message.get('ip')
-                file_port = message.get('file_port', self.file_port)
-                
-                self.user_directory[user_id] = {
-                    "name": user_name,
-                    "ip": user_ip,
-                    "last_seen": datetime.now().isoformat(),
-                    "is_online": True,
-                    "file_port": file_port
-                }
-                
-                self.save_config()
-                self.root.after(0, self.update_contacts_list)
-                self.root.after(0, self.add_chat_message,
-                              f"Connected to {user_name}", "system")
-            
-            elif msg_type == 'message':
-                from_id = message.get('from_id')
-                from_name = message.get('from_name')
-                msg_text = message.get('message')
-                
-                if from_id in self.user_directory:
-                    self.user_directory[from_id]['last_seen'] = datetime.now().isoformat()
-                    self.user_directory[from_id]['is_online'] = True
-                
-                if from_id == self.selected_contact_id:
-                    self.root.after(0, self.add_chat_message, msg_text, from_name)
-                else:
-                    self.root.after(0, self.add_chat_message,
-                                  f"New message from {from_name}", "system")
-            
-            elif msg_type == 'file_request':
-                from_id = message.get('from_id')
-                from_name = message.get('from_name')
-                filename = message.get('filename')
-                filesize = message.get('filesize')
-                transfer_id = message.get('transfer_id')
-                
-                # Ask user to accept file
-                self.root.after(0, self.show_file_request_dialog,
-                              from_id, from_name, filename, filesize, transfer_id)
-                
-        except json.JSONDecodeError:
+            # In real implementation, would need to know recipient's IP
+            # For demo, we'll simulate
+            pass
+        except:
             pass
     
-    def show_file_request_dialog(self, from_id, from_name, filename, filesize, transfer_id):
-        """Show dialog to accept/reject file transfer"""
-        filesize_mb = filesize / 1024 / 1024
+    def receive_message(self, message):
+        """Receive message from network"""
+        from_id = message.get('from_id')
+        from_name = message.get('from_name')
+        text = message.get('text')
+        timestamp = message.get('timestamp', time.time())
         
-        # Create a dialog window
+        # Find or create chat
+        chat_id = None
+        for i, chat in enumerate(self.chats):
+            if chat.get('id') == from_id:
+                chat_id = i
+                break
+        
+        if chat_id is None:
+            # Add new chat
+            chat_data = {
+                'id': from_id,
+                'name': from_name,
+                'last_message': text,
+                'time': self.format_timestamp(timestamp),
+                'avatar': self.get_random_avatar(),
+                'color': self.get_random_color(),
+                'unread': 1
+            }
+            self.chats.append(chat_data)
+            chat_id = len(self.chats) - 1
+            self.root.after(0, self.refresh_chat_list)
+        
+        # Save message
+        if from_id not in self.messages:
+            self.messages[from_id] = []
+        
+        self.messages[from_id].append({
+            'text': text,
+            'sent': False,
+            'time': timestamp,
+            'sender': from_name
+        })
+        
+        # Update last message
+        self.chats[chat_id]['last_message'] = text
+        self.chats[chat_id]['time'] = self.format_timestamp(timestamp)
+        if 'unread' in self.chats[chat_id]:
+            self.chats[chat_id]['unread'] += 1
+        else:
+            self.chats[chat_id]['unread'] = 1
+        
+        self.save_messages()
+        self.save_chats()
+        
+        # Show notification
+        if chat_id != self.current_chat_index:
+            self.root.after(0, lambda: self.show_notification(from_name, text))
+        
+        self.root.after(0, self.refresh_chat_list)
+    
+    def show_notification(self, name, text):
+        """Show desktop notification"""
+        # In real implementation, would use system notifications
+        print(f"New message from {name}: {text}")
+    
+    def format_timestamp(self, ts):
+        """Format timestamp for display"""
+        dt = datetime.datetime.fromtimestamp(ts)
+        now = datetime.datetime.now()
+        
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M")
+        elif (now - dt).days < 7:
+            return dt.strftime("%A")[:3]
+        else:
+            return dt.strftime("%m/%d")
+    
+    # ==================== LOGIN SCREEN ====================
+    
+    def show_login_screen(self):
+        """Show the initial login/registration screen"""
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        
+        main_frame = tk.Frame(self.root, bg='#0f0f0f')
+        main_frame.pack(expand=True, fill='both')
+        
+        # Center content
+        center_frame = tk.Frame(main_frame, bg='#0f0f0f')
+        center_frame.place(relx=0.5, rely=0.5, anchor='center')
+        
+        # Logo
+        logo_label = tk.Label(center_frame, text="📱", bg='#0f0f0f', fg=self.theme_color,
+                             font=('Arial', 64))
+        logo_label.pack(pady=(0, 20))
+        
+        # Title
+        title_label = tk.Label(center_frame, text="Welcome to Telegram", bg='#0f0f0f', fg='white',
+                              font=('Arial', 24, 'bold'))
+        title_label.pack(pady=(0, 30))
+        
+        # Form frame
+        form_frame = tk.Frame(center_frame, bg='#1f1f1f', padx=40, pady=30)
+        form_frame.pack()
+        
+        # Display Name
+        tk.Label(form_frame, text="Display Name", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        self.name_entry = tk.Entry(form_frame, bg='#2f2f2f', fg='white',
+                                   insertbackground='white', font=('Arial', 12),
+                                   width=30, bd=0, highlightthickness=1,
+                                   highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        self.name_entry.pack(pady=(0, 15))
+        self.name_entry.focus_set()
+        
+        # Username
+        tk.Label(form_frame, text="Username", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        self.username_entry = tk.Entry(form_frame, bg='#2f2f2f', fg='white',
+                                      insertbackground='white', font=('Arial', 12),
+                                      width=30, bd=0, highlightthickness=1,
+                                      highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        self.username_entry.pack(pady=(0, 15))
+        
+        # Phone
+        tk.Label(form_frame, text="Phone Number", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        self.phone_entry = tk.Entry(form_frame, bg='#2f2f2f', fg='white',
+                                   insertbackground='white', font=('Arial', 12),
+                                   width=30, bd=0, highlightthickness=1,
+                                   highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        self.phone_entry.pack(pady=(0, 20))
+        
+        # Start button
+        start_btn = tk.Button(form_frame, text="Start Messaging", bg=self.theme_color, fg='white',
+                             font=('Arial', 12, 'bold'), padx=30, pady=10,
+                             command=self.complete_login)
+        start_btn.pack()
+    
+    def complete_login(self):
+        """Complete the login process"""
+        display_name = self.name_entry.get().strip()
+        username = self.username_entry.get().strip()
+        phone = self.phone_entry.get().strip()
+        
+        if not display_name:
+            messagebox.showerror("Error", "Please enter your display name")
+            return
+        
+        if not username:
+            # Generate a username from display name
+            username = display_name.lower().replace(' ', '_') + str(random.randint(100, 999))
+        
+        # Generate unique user ID
+        unique_string = f"{display_name}_{username}_{datetime.datetime.now().isoformat()}_{random.randint(1000, 9999)}"
+        self.user_id = hashlib.md5(unique_string.encode()).hexdigest()[:16]
+        
+        self.display_name = display_name
+        self.username = username
+        self.phone = phone
+        self.is_logged_in = True
+        
+        # Save user data
+        self.save_user_data()
+        
+        # Add saved messages chat
+        self.chats.append({
+            'id': 'saved',
+            'name': 'Saved Messages',
+            'last_message': 'Your notes and media',
+            'time': 'now',
+            'avatar': '📌',
+            'color': '#fbc02d',
+            'pinned': True
+        })
+        
+        self.save_chats()
+        
+        # Setup main UI
+        self.setup_main_ui()
+    
+    # ==================== MAIN UI ====================
+    
+    def setup_main_ui(self):
+        """Setup the main UI after login"""
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        
+        # Main container
+        main_container = tk.Frame(self.root, bg='#0f0f0f')
+        main_container.pack(fill='both', expand=True)
+        
+        # Left panel - Chat list
+        left_panel = tk.Frame(main_container, bg='#1f1f1f', width=350)
+        left_panel.pack(side='left', fill='y')
+        left_panel.pack_propagate(False)
+        
+        # Right panel - Chat area
+        self.right_panel = tk.Frame(main_container, bg='#0f0f0f')
+        self.right_panel.pack(side='right', fill='both', expand=True)
+        
+        # ========== LEFT PANEL ==========
+        
+        # Top bar
+        top_bar = tk.Frame(left_panel, bg='#1f1f1f', height=60)
+        top_bar.pack(fill='x')
+        top_bar.pack_propagate(False)
+        
+        # Menu button
+        menu_btn = tk.Button(top_bar, text="☰", bg='#1f1f1f', fg='white',
+                            font=('Arial', 16), bd=0, activebackground='#2f2f2f',
+                            cursor='hand2', command=self.toggle_menu)
+        menu_btn.pack(side='left', padx=15, pady=15)
+        
+        # Search bar
+        search_frame = tk.Frame(top_bar, bg='#2f2f2f', height=36)
+        search_frame.pack(side='left', fill='x', expand=True, padx=5, pady=12)
+        search_frame.pack_propagate(False)
+        
+        search_icon = tk.Label(search_frame, text="🔍", bg='#2f2f2f', fg='#888',
+                              font=('Arial', 12))
+        search_icon.pack(side='left', padx=(10, 5))
+        
+        self.search_entry = tk.Entry(search_frame, bg='#2f2f2f', fg='white',
+                                     insertbackground='white', font=('Arial', 12),
+                                     bd=0, highlightthickness=0)
+        self.search_entry.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        self.search_entry.insert(0, "Search")
+        self.search_entry.bind('<FocusIn>', self.clear_search_placeholder)
+        self.search_entry.bind('<FocusOut>', self.restore_search_placeholder)
+        self.search_entry.bind('<KeyRelease>', self.search_chats)
+        
+        # Profile button
+        profile_btn = tk.Button(top_bar, text="👤", bg='#1f1f1f', fg='white',
+                               font=('Arial', 16), bd=0, activebackground='#2f2f2f',
+                               cursor='hand2', command=self.open_profile)
+        profile_btn.pack(side='right', padx=15, pady=15)
+        
+        # Chat tabs
+        tab_frame = tk.Frame(left_panel, bg='#1f1f1f', height=40)
+        tab_frame.pack(fill='x')
+        tab_frame.pack_propagate(False)
+        
+        self.chats_tab = tk.Button(tab_frame, text="Chats", bg='#2f2f2f', fg='white',
+                                  font=('Arial', 11), bd=0, command=self.show_chats)
+        self.chats_tab.pack(side='left', fill='both', expand=True)
+        
+        self.contacts_tab = tk.Button(tab_frame, text="Contacts", bg='#1f1f1f', fg='#888',
+                                     font=('Arial', 11), bd=0, command=self.show_contacts)
+        self.contacts_tab.pack(side='left', fill='both', expand=True)
+        
+        # Chat list container
+        self.chat_container = tk.Frame(left_panel, bg='#1f1f1f')
+        self.chat_container.pack(fill='both', expand=True)
+        
+        # Create scrollable chat list
+        self.create_chat_list()
+        
+        # Show empty chat area
+        self.show_empty_chat()
+    
+    def create_chat_list(self):
+        """Create scrollable chat list"""
+        # Clear container
+        for widget in self.chat_container.winfo_children():
+            widget.destroy()
+        
+        # Canvas for scrolling
+        canvas = tk.Canvas(self.chat_container, bg='#1f1f1f', highlightthickness=0)
+        scrollbar = tk.Scrollbar(self.chat_container, orient='vertical', command=canvas.yview)
+        self.chat_scrollable = tk.Frame(canvas, bg='#1f1f1f')
+        
+        self.chat_scrollable.bind(
+            '<Configure>',
+            lambda e: canvas.configure(scrollregion=canvas.bbox('all'))
+        )
+        
+        canvas.create_window((0, 0), window=self.chat_scrollable, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # Bind mouse wheel
+        canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), 'units'))
+        
+        # Populate chats
+        self.refresh_chat_list()
+    
+    def refresh_chat_list(self):
+        """Refresh the chat list display"""
+        # Clear existing
+        for widget in self.chat_scrollable.winfo_children():
+            widget.destroy()
+        
+        # Add archived chats if any
+        if self.archived_chats:
+            archive_frame = tk.Frame(self.chat_scrollable, bg='#1f1f1f')
+            archive_frame.pack(fill='x', pady=1)
+            
+            archive_btn = tk.Button(archive_frame, text="📁 Archived Chats", bg='#1f1f1f', fg='#888',
+                                   font=('Arial', 12), anchor='w', padx=20, pady=10,
+                                   command=self.show_archived)
+            archive_btn.pack(fill='x')
+        
+        # Separate saved messages from other chats
+        saved_chat = None
+        other_chats = []
+        for chat in self.chats:
+            if chat.get('id') == 'saved':
+                saved_chat = chat
+            else:
+                other_chats.append(chat)
+        
+        # Always show saved messages first
+        if saved_chat:
+            self.render_chat_item(saved_chat, pinned=True)
+        
+        # Show pinned chats (excluding saved)
+        pinned = [c for c in other_chats if c.get('pinned')]
+        for chat in pinned:
+            self.render_chat_item(chat, pinned=True)
+        
+        # Show regular chats
+        regular = [c for c in other_chats if not c.get('pinned')]
+        for chat in regular:
+            self.render_chat_item(chat)
+    
+    def render_chat_item(self, chat, pinned=False):
+        """Render a single chat item"""
+        frame = tk.Frame(self.chat_scrollable, bg='#1f1f1f', height=70)
+        frame.pack(fill='x', pady=1)
+        frame.pack_propagate(False)
+        
+        # Store chat ID
+        frame.chat_id = chat.get('id')
+        
+        # Bind click
+        frame.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        # Avatar
+        avatar = tk.Frame(frame, bg=chat['color'], width=50, height=50)
+        avatar.pack(side='left', padx=(15, 10), pady=10)
+        avatar.pack_propagate(False)
+        
+        avatar_label = tk.Label(avatar, text=chat['avatar'], bg=chat['color'],
+                               fg='white', font=('Arial', 20))
+        avatar_label.pack(expand=True)
+        avatar_label.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        # Info
+        info = tk.Frame(frame, bg='#1f1f1f')
+        info.pack(side='left', fill='both', expand=True, pady=10)
+        info.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        # Top row
+        top = tk.Frame(info, bg='#1f1f1f')
+        top.pack(fill='x')
+        top.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        name = tk.Label(top, text=chat['name'], bg='#1f1f1f', fg='white',
+                       font=('Arial', 13, 'bold'))
+        name.pack(side='left')
+        name.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        time = tk.Label(top, text=chat['time'], bg='#1f1f1f', fg='#888',
+                       font=('Arial', 11))
+        time.pack(side='right', padx=(0, 15))
+        time.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        # Bottom row
+        bottom = tk.Frame(info, bg='#1f1f1f')
+        bottom.pack(fill='x', pady=(2, 0))
+        bottom.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        # Pin icon if pinned
+        if pinned:
+            pin = tk.Label(bottom, text="📌", bg='#1f1f1f', fg='#888',
+                          font=('Arial', 11))
+            pin.pack(side='left', padx=(0, 3))
+            pin.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        # Last message
+        last = tk.Label(bottom, text=chat['last_message'], bg='#1f1f1f', fg='#888',
+                       font=('Arial', 11), anchor='w')
+        last.pack(side='left', fill='x', expand=True)
+        last.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+        
+        # Unread count
+        if chat.get('unread', 0) > 0:
+            unread = tk.Frame(bottom, bg='#4CAF50', width=20, height=20)
+            unread.pack(side='right', padx=(0, 15))
+            unread.pack_propagate(False)
+            
+            unread_label = tk.Label(unread, text=str(chat['unread']), bg='#4CAF50',
+                                   fg='white', font=('Arial', 10, 'bold'))
+            unread_label.pack(expand=True)
+            unread_label.bind('<Button-1>', lambda e, c=chat: self.open_chat(c))
+    
+    def show_empty_chat(self):
+        """Show empty chat area"""
+        for widget in self.right_panel.winfo_children():
+            widget.destroy()
+        
+        center = tk.Frame(self.right_panel, bg='#0f0f0f')
+        center.pack(expand=True)
+        
+        logo = tk.Label(center, text="📱", bg='#0f0f0f', fg='#2f2f2f',
+                       font=('Arial', 48))
+        logo.pack(pady=(0, 10))
+        
+        welcome = tk.Label(center, text=f"Welcome, {self.display_name}!",
+                          bg='#0f0f0f', fg='white', font=('Arial', 18, 'bold'))
+        welcome.pack(pady=(0, 5))
+        
+        select = tk.Label(center, text="Select a chat to start messaging",
+                         bg='#0f0f0f', fg='#888', font=('Arial', 16))
+        select.pack()
+    
+    def open_chat(self, chat):
+        """Open a chat"""
+        # Find index
+        for i, c in enumerate(self.chats):
+            if c.get('id') == chat.get('id'):
+                self.current_chat_index = i
+                self.current_chat_id = chat.get('id')
+                break
+        
+        # Reset unread
+        if chat.get('unread', 0) > 0:
+            chat['unread'] = 0
+            self.save_chats()
+        
+        # Show chat interface
+        self.show_chat_interface(chat)
+    
+    def show_chat_interface(self, chat):
+        """Show the chat interface"""
+        for widget in self.right_panel.winfo_children():
+            widget.destroy()
+        
+        # Header
+        header = tk.Frame(self.right_panel, bg='#1f1f1f', height=60)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+        
+        # Back button (mobile style)
+        back_btn = tk.Button(header, text="←", bg='#1f1f1f', fg='white',
+                            font=('Arial', 16), bd=0, command=self.show_empty_chat)
+        back_btn.pack(side='left', padx=10, pady=15)
+        
+        # Avatar
+        avatar = tk.Frame(header, bg=chat['color'], width=40, height=40)
+        avatar.pack(side='left', padx=5, pady=10)
+        avatar.pack_propagate(False)
+        
+        tk.Label(avatar, text=chat['avatar'], bg=chat['color'],
+                fg='white', font=('Arial', 16)).pack(expand=True)
+        
+        # Name and status
+        name_status = tk.Frame(header, bg='#1f1f1f')
+        name_status.pack(side='left', fill='both', expand=True, pady=10)
+        
+        tk.Label(name_status, text=chat['name'], bg='#1f1f1f', fg='white',
+                font=('Arial', 14, 'bold')).pack(anchor='w')
+        
+        # Status
+        if chat.get('id') == 'saved':
+            status = "Your cloud storage"
+            status_color = '#888'
+        else:
+            status = "online" if random.random() > 0.5 else "last seen recently"
+            status_color = '#4CAF50' if status == "online" else '#888'
+        
+        tk.Label(name_status, text=status, bg='#1f1f1f', fg=status_color,
+                font=('Arial', 10)).pack(anchor='w')
+        
+        # Call buttons (not for saved messages)
+        if chat.get('id') != 'saved':
+            call_frame = tk.Frame(header, bg='#1f1f1f')
+            call_frame.pack(side='right', padx=10)
+            
+            tk.Button(call_frame, text="📞", bg='#1f1f1f', fg='white',
+                     font=('Arial', 14), bd=0).pack(side='left', padx=5)
+            tk.Button(call_frame, text="📹", bg='#1f1f1f', fg='white',
+                     font=('Arial', 14), bd=0).pack(side='left', padx=5)
+        
+        # Menu button
+        menu_btn = tk.Button(header, text="⋮", bg='#1f1f1f', fg='white',
+                            font=('Arial', 16), bd=0,
+                            command=lambda: self.show_chat_menu(chat))
+        menu_btn.pack(side='right', padx=10)
+        
+        # Messages area
+        messages_frame = tk.Frame(self.right_panel, bg='#0f0f0f')
+        messages_frame.pack(fill='both', expand=True)
+        
+        # Canvas for scrolling messages
+        canvas = tk.Canvas(messages_frame, bg='#0f0f0f', highlightthickness=0)
+        scrollbar = tk.Scrollbar(messages_frame, orient='vertical', command=canvas.yview)
+        self.messages_scrollable = tk.Frame(canvas, bg='#0f0f0f')
+        
+        self.messages_scrollable.bind(
+            '<Configure>',
+            lambda e: canvas.configure(scrollregion=canvas.bbox('all'))
+        )
+        
+        canvas.create_window((0, 0), window=self.messages_scrollable, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), 'units'))
+        
+        # Load messages
+        self.load_messages_display(chat)
+        
+        # Input area
+        input_frame = tk.Frame(self.right_panel, bg='#1f1f1f', height=70)
+        input_frame.pack(fill='x', side='bottom')
+        input_frame.pack_propagate(False)
+        
+        # Attach button
+        attach_btn = tk.Button(input_frame, text="📎", bg='#1f1f1f', fg='white',
+                              font=('Arial', 16), bd=0, command=lambda: self.attach_file(chat))
+        attach_btn.pack(side='left', padx=10, pady=20)
+        
+        # Emoji button
+        emoji_btn = tk.Button(input_frame, text="😊", bg='#1f1f1f', fg='white',
+                             font=('Arial', 16), bd=0, command=self.show_emoji_picker)
+        emoji_btn.pack(side='left', padx=5, pady=20)
+        
+        # Message entry
+        self.message_entry = tk.Text(input_frame, bg='#2f2f2f', fg='white',
+                                     insertbackground='white', font=('Arial', 12),
+                                     height=2, width=50, bd=0, wrap='word')
+        self.message_entry.pack(side='left', fill='both', expand=True, padx=5, pady=15)
+        self.message_entry.bind('<Return>', lambda e: self.send_message(chat))
+        self.message_entry.bind('<Shift-Return>', lambda e: None)
+        
+        # Send button
+        send_btn = tk.Button(input_frame, text="📤", bg='#1f1f1f', fg='white',
+                            font=('Arial', 16), bd=0, command=lambda: self.send_message(chat))
+        send_btn.pack(side='right', padx=15, pady=20)
+    
+    def load_messages_display(self, chat):
+        """Load and display messages"""
+        chat_id = chat.get('id')
+        if chat_id in self.messages:
+            for msg in self.messages[chat_id]:
+                self.display_message(msg, chat)
+    
+    def display_message(self, msg, chat):
+        """Display a single message"""
+        frame = tk.Frame(self.messages_scrollable, bg='#0f0f0f')
+        frame.pack(fill='x', pady=2, padx=10)
+        
+        if msg['sent']:
+            # Sent message (right)
+            bubble = tk.Frame(frame, bg='#005c4b')
+            bubble.pack(side='right')
+            
+            # Message text
+            text = tk.Label(bubble, text=msg['text'], bg='#005c4b', fg='white',
+                           font=('Arial', 11), wraplength=300, justify='left',
+                           padx=10, pady=5)
+            text.pack()
+            
+            # Time
+            time_str = datetime.datetime.fromtimestamp(msg['time']).strftime("%H:%M")
+            time_label = tk.Label(bubble, text=time_str, bg='#005c4b', fg='#aaa',
+                                 font=('Arial', 8))
+            time_label.pack(anchor='e', padx=5, pady=(0, 2))
+        else:
+            # Received message (left)
+            bubble = tk.Frame(frame, bg='#1f1f1f')
+            bubble.pack(side='left')
+            
+            # Sender name for groups
+            if chat.get('is_group'):
+                sender = tk.Label(bubble, text=msg.get('sender', ''), bg='#1f1f1f', fg=self.theme_color,
+                                 font=('Arial', 10, 'bold'))
+                sender.pack(anchor='w', padx=10, pady=(5, 0))
+            
+            # Message text
+            text = tk.Label(bubble, text=msg['text'], bg='#1f1f1f', fg='white',
+                           font=('Arial', 11), wraplength=300, justify='left',
+                           padx=10, pady=5)
+            text.pack()
+            
+            # Time
+            time_str = datetime.datetime.fromtimestamp(msg['time']).strftime("%H:%M")
+            time_label = tk.Label(bubble, text=time_str, bg='#1f1f1f', fg='#aaa',
+                                 font=('Arial', 8))
+            time_label.pack(anchor='e', padx=5, pady=(0, 2))
+    
+    def send_message(self, chat):
+        """Send a message"""
+        text = self.message_entry.get('1.0', 'end-1c').strip()
+        if not text:
+            return
+        
+        # Clear input
+        self.message_entry.delete('1.0', tk.END)
+        
+        # Create message
+        timestamp = time.time()
+        msg = {
+            'text': text,
+            'sent': True,
+            'time': timestamp,
+            'sender': self.display_name
+        }
+        
+        # Save message
+        chat_id = chat.get('id')
+        if chat_id not in self.messages:
+            self.messages[chat_id] = []
+        
+        self.messages[chat_id].append(msg)
+        self.save_messages()
+        
+        # Display message
+        self.display_message(msg, chat)
+        
+        # Update chat list
+        for i, c in enumerate(self.chats):
+            if c.get('id') == chat_id:
+                self.chats[i]['last_message'] = text
+                self.chats[i]['time'] = self.format_timestamp(timestamp)
+                break
+        
+        self.save_chats()
+        self.refresh_chat_list()
+        
+        # Scroll to bottom
+        self.messages_scrollable.update_idletasks()
+        self.messages_scrollable.master.yview_moveto(1.0)
+        
+        # Simulate reply after delay (for demo)
+        if chat_id != 'saved':
+            self.root.after(2000, lambda: self.simulate_reply(chat))
+    
+    def simulate_reply(self, chat):
+        """Simulate a reply (for demo)"""
+        replies = [
+            "👍",
+            "Thanks!",
+            "😊",
+            "Got it",
+            "Sounds good",
+            "OK",
+            "👋",
+            "I'll check later"
+        ]
+        
+        timestamp = time.time()
+        msg = {
+            'text': random.choice(replies),
+            'sent': False,
+            'time': timestamp,
+            'sender': chat['name']
+        }
+        
+        chat_id = chat.get('id')
+        self.messages[chat_id].append(msg)
+        self.save_messages()
+        
+        self.display_message(msg, chat)
+        
+        # Update unread count if chat not open
+        if chat_id != self.current_chat_id:
+            for i, c in enumerate(self.chats):
+                if c.get('id') == chat_id:
+                    self.chats[i]['unread'] = self.chats[i].get('unread', 0) + 1
+                    self.chats[i]['last_message'] = msg['text']
+                    self.chats[i]['time'] = self.format_timestamp(timestamp)
+                    break
+            
+            self.save_chats()
+            self.refresh_chat_list()
+    
+    def attach_file(self, chat):
+        """Attach and send a file"""
+        filename = filedialog.askopenfilename()
+        if not filename:
+            return
+        
+        # Copy file to downloads
+        basename = os.path.basename(filename)
+        dest = os.path.join(self.download_dir, f"{int(time.time())}_{basename}")
+        shutil.copy2(filename, dest)
+        
+        # Send as message
+        filesize = os.path.getsize(filename)
+        if filesize < 1024 * 1024:
+            size_str = f"{filesize/1024:.1f} KB"
+        else:
+            size_str = f"{filesize/(1024*1024):.1f} MB"
+        
+        msg_text = f"📎 File: {basename} ({size_str})"
+        
+        timestamp = time.time()
+        msg = {
+            'text': msg_text,
+            'sent': True,
+            'time': timestamp,
+            'file': dest
+        }
+        
+        chat_id = chat.get('id')
+        if chat_id not in self.messages:
+            self.messages[chat_id] = []
+        
+        self.messages[chat_id].append(msg)
+        self.save_messages()
+        
+        self.display_message(msg, chat)
+        
+        # Update chat list
+        for i, c in enumerate(self.chats):
+            if c.get('id') == chat_id:
+                self.chats[i]['last_message'] = msg_text
+                self.chats[i]['time'] = self.format_timestamp(timestamp)
+                break
+        
+        self.save_chats()
+        self.refresh_chat_list()
+    
+    def show_emoji_picker(self):
+        """Show emoji picker (simplified)"""
+        emojis = "😊😂❤️👍🔥🎉😢😡🤔😴🥳😎👋🙏💯"
+        pos = self.message_entry.winfo_pointerxy()
+        
+        popup = tk.Toplevel(self.root)
+        popup.title("Emojis")
+        popup.geometry(f"300x150+{pos[0]}+{pos[1]}")
+        popup.configure(bg='#1f1f1f')
+        
+        frame = tk.Frame(popup, bg='#1f1f1f')
+        frame.pack(padx=10, pady=10)
+        
+        row = 0
+        col = 0
+        for emoji in emojis:
+            btn = tk.Button(frame, text=emoji, bg='#2f2f2f', fg='white',
+                           font=('Arial', 16), width=2, height=1,
+                           command=lambda e=emoji: self.insert_emoji(e))
+            btn.grid(row=row, column=col, padx=2, pady=2)
+            col += 1
+            if col > 5:
+                col = 0
+                row += 1
+    
+    def insert_emoji(self, emoji):
+        """Insert emoji into message"""
+        self.message_entry.insert('insert', emoji)
+    
+    def show_chat_menu(self, chat):
+        """Show chat menu"""
+        menu = tk.Menu(self.root, tearoff=0, bg='#1f1f1f', fg='white')
+        menu.add_command(label="📌 Pin", command=lambda: self.pin_chat(chat))
+        menu.add_command(label="🔕 Mute", command=lambda: self.mute_chat(chat))
+        menu.add_command(label="📁 Archive", command=lambda: self.archive_chat(chat))
+        menu.add_separator()
+        menu.add_command(label="🗑️ Delete", command=lambda: self.delete_chat(chat))
+        
+        pos = self.root.winfo_pointerxy()
+        menu.post(pos[0], pos[1])
+    
+    def pin_chat(self, chat):
+        """Pin a chat"""
+        for c in self.chats:
+            if c.get('id') == chat.get('id'):
+                c['pinned'] = not c.get('pinned', False)
+                break
+        self.save_chats()
+        self.refresh_chat_list()
+    
+    def mute_chat(self, chat):
+        """Mute a chat"""
+        for c in self.chats:
+            if c.get('id') == chat.get('id'):
+                c['muted'] = not c.get('muted', False)
+                break
+        self.save_chats()
+    
+    def archive_chat(self, chat):
+        """Archive a chat"""
+        for i, c in enumerate(self.chats):
+            if c.get('id') == chat.get('id'):
+                self.archived_chats.append(c)
+                del self.chats[i]
+                break
+        self.save_chats()
+        self.refresh_chat_list()
+    
+    def delete_chat(self, chat):
+        """Delete a chat"""
+        if messagebox.askyesno("Delete Chat", f"Delete chat with {chat['name']}?"):
+            for i, c in enumerate(self.chats):
+                if c.get('id') == chat.get('id'):
+                    del self.chats[i]
+                    break
+            
+            if chat.get('id') in self.messages:
+                del self.messages[chat.get('id')]
+            
+            self.save_chats()
+            self.save_messages()
+            self.refresh_chat_list()
+            self.show_empty_chat()
+    
+    def show_archived(self):
+        """Show archived chats"""
+        # Create archive window
+        archive_win = tk.Toplevel(self.root)
+        archive_win.title("Archived Chats")
+        archive_win.geometry("350x500")
+        archive_win.configure(bg='#1f1f1f')
+        
+        tk.Label(archive_win, text="📁 Archived Chats", bg='#1f1f1f', fg='white',
+                font=('Arial', 16, 'bold')).pack(pady=10)
+        
+        if not self.archived_chats:
+            tk.Label(archive_win, text="No archived chats", bg='#1f1f1f', fg='#888',
+                    font=('Arial', 12)).pack(pady=20)
+        else:
+            frame = tk.Frame(archive_win, bg='#1f1f1f')
+            frame.pack(fill='both', expand=True, padx=10)
+            
+            for chat in self.archived_chats:
+                chat_frame = tk.Frame(frame, bg='#1f1f1f')
+                chat_frame.pack(fill='x', pady=2)
+                
+                tk.Label(chat_frame, text=f"{chat['avatar']} {chat['name']}",
+                        bg='#1f1f1f', fg='white', font=('Arial', 12)).pack(side='left')
+                
+                tk.Button(chat_frame, text="Unarchive", bg='#2f2f2f', fg='white',
+                         font=('Arial', 10), command=lambda c=chat: self.unarchive_chat(c, archive_win)
+                        ).pack(side='right')
+    
+    def unarchive_chat(self, chat, window):
+        """Unarchive a chat"""
+        for i, c in enumerate(self.archived_chats):
+            if c.get('id') == chat.get('id'):
+                self.chats.append(c)
+                del self.archived_chats[i]
+                break
+        self.save_chats()
+        window.destroy()
+        self.refresh_chat_list()
+    
+    def show_chats(self):
+        """Show chats tab"""
+        self.chats_tab.config(bg='#2f2f2f', fg='white')
+        self.contacts_tab.config(bg='#1f1f1f', fg='#888')
+        self.refresh_chat_list()
+    
+    def show_contacts(self):
+        """Show contacts tab"""
+        self.chats_tab.config(bg='#1f1f1f', fg='#888')
+        self.contacts_tab.config(bg='#2f2f2f', fg='white')
+        
+        # Clear and show contacts
+        for widget in self.chat_scrollable.winfo_children():
+            widget.destroy()
+        
+        # Create a special Saved Messages entry at the top
+        saved_frame = tk.Frame(self.chat_scrollable, bg='#1f1f1f', height=60)
+        saved_frame.pack(fill='x', pady=1)
+        saved_frame.pack_propagate(False)
+        
+        # Store a special identifier
+        saved_frame.is_saved = True
+        
+        saved_avatar = tk.Frame(saved_frame, bg='#fbc02d', width=50, height=50)
+        saved_avatar.pack(side='left', padx=(15,10), pady=10)
+        saved_avatar.pack_propagate(False)
+        
+        tk.Label(saved_avatar, text="📌", bg='#fbc02d', fg='white',
+                font=('Arial', 20)).pack(expand=True)
+        
+        saved_info = tk.Frame(saved_frame, bg='#1f1f1f')
+        saved_info.pack(side='left', fill='both', expand=True, pady=10)
+        
+        tk.Label(saved_info, text="Saved Messages", bg='#1f1f1f', fg='white',
+                font=('Arial', 12, 'bold')).pack(anchor='w')
+        
+        tk.Label(saved_info, text="Your cloud storage", bg='#1f1f1f', fg='#888',
+                font=('Arial', 10)).pack(anchor='w')
+        
+        # Message button for Saved Messages
+        saved_btn = tk.Button(saved_frame, text="💬", bg='#2f2f2f', fg='white',
+                             font=('Arial', 12), 
+                             command=lambda: self.open_saved_messages())
+        saved_btn.pack(side='right', padx=10, pady=15)
+        
+        # Make the whole frame clickable
+        saved_frame.bind('<Button-1>', lambda e: self.open_saved_messages())
+        saved_avatar.bind('<Button-1>', lambda e: self.open_saved_messages())
+        saved_info.bind('<Button-1>', lambda e: self.open_saved_messages())
+        
+        # Add New Contact button
+        new_contact_btn = tk.Button(self.chat_scrollable, text="+ Add New Contact", 
+                                   bg='#2f2f2f', fg='white', font=('Arial', 12),
+                                   padx=10, pady=8, command=self.add_new_contact)
+        new_contact_btn.pack(fill='x', padx=10, pady=5)
+        
+        # Separator
+        sep = tk.Frame(self.chat_scrollable, bg='#2f2f2f', height=1)
+        sep.pack(fill='x', pady=5)
+        
+        if not self.contacts:
+            empty = tk.Label(self.chat_scrollable, text="No contacts yet", bg='#1f1f1f', fg='#888',
+                            font=('Arial', 12))
+            empty.pack(pady=20)
+        else:
+            for contact in self.contacts:
+                frame = tk.Frame(self.chat_scrollable, bg='#1f1f1f', height=60)
+                frame.pack(fill='x', pady=1)
+                frame.pack_propagate(False)
+                
+                # Store contact info
+                frame.contact = contact
+                
+                # Avatar
+                avatar = tk.Frame(frame, bg=contact.get('color', '#4a6da8'), width=40, height=40)
+                avatar.pack(side='left', padx=(15, 10), pady=10)
+                avatar.pack_propagate(False)
+                
+                tk.Label(avatar, text=contact.get('avatar', '👤'), bg=contact.get('color', '#4a6da8'),
+                        fg='white', font=('Arial', 16)).pack(expand=True)
+                
+                # Info
+                info = tk.Frame(frame, bg='#1f1f1f')
+                info.pack(side='left', fill='both', expand=True, pady=10)
+                
+                name = tk.Label(info, text=contact['name'], bg='#1f1f1f', fg='white',
+                               font=('Arial', 12, 'bold'))
+                name.pack(anchor='w')
+                
+                username = tk.Label(info, text=f"@{contact['username']}", bg='#1f1f1f', fg='#888',
+                                   font=('Arial', 10))
+                username.pack(anchor='w')
+                
+                # Message button
+                msg_btn = tk.Button(frame, text="💬", bg='#2f2f2f', fg='white',
+                                   font=('Arial', 12), 
+                                   command=lambda c=contact: self.message_contact(c))
+                msg_btn.pack(side='right', padx=10, pady=15)
+                
+                # Make frame clickable
+                frame.bind('<Button-1>', lambda e, c=contact: self.message_contact(c))
+                avatar.bind('<Button-1>', lambda e, c=contact: self.message_contact(c))
+                info.bind('<Button-1>', lambda e, c=contact: self.message_contact(c))
+    
+    def add_new_contact(self):
+        """Add a new contact"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("File Transfer Request")
-        dialog.configure(bg='#1a1a1a')
-        dialog.geometry("400x200")
+        dialog.title("Add New Contact")
+        dialog.geometry("350x300")
+        dialog.configure(bg='#1f1f1f')
         dialog.transient(self.root)
         dialog.grab_set()
         
         # Center the dialog
         dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
-        y = (dialog.winfo_screenheight() // 2) - (height // 2)
-        dialog.geometry(f'{width}x{height}+{x}+{y}')
+        x = (dialog.winfo_screenwidth() // 2) - (350 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (300 // 2)
+        dialog.geometry(f"+{x}+{y}")
         
-        # Message
-        message = f"{from_name} wants to send you a file:\n\n"
-        message += f"📁 {filename}\n"
-        message += f"📏 Size: {filesize_mb:.1f} MB\n\n"
-        message += "Do you want to accept this file?"
+        # Form
+        form = tk.Frame(dialog, bg='#1f1f1f', padx=20, pady=20)
+        form.pack(fill='both', expand=True)
         
-        label = tk.Label(
-            dialog,
-            text=message,
-            font=('Arial', 11),
-            fg='white',
-            bg='#1a1a1a',
-            justify='left'
-        )
-        label.pack(pady=20, padx=20)
+        tk.Label(form, text="Add New Contact", bg='#1f1f1f', fg='white',
+                font=('Arial', 16, 'bold')).pack(pady=(0, 20))
         
-        # Buttons frame
-        button_frame = tk.Frame(dialog, bg='#1a1a1a')
-        button_frame.pack(pady=10)
+        tk.Label(form, text="Name:", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
         
-        def accept_file():
-            # Create transfer entry
-            self.file_transfers[transfer_id] = {
-                'type': 'receiving',
-                'filename': filename,
-                'size': filesize,
-                'progress': 0,
-                'status': 'pending',
-                'user_id': from_id
+        name_entry = tk.Entry(form, bg='#2f2f2f', fg='white',
+                             insertbackground='white', font=('Arial', 12),
+                             width=30, bd=0, highlightthickness=1,
+                             highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        name_entry.pack(pady=(0, 10))
+        name_entry.focus_set()
+        
+        tk.Label(form, text="Username:", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        username_entry = tk.Entry(form, bg='#2f2f2f', fg='white',
+                                 insertbackground='white', font=('Arial', 12),
+                                 width=30, bd=0, highlightthickness=1,
+                                 highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        username_entry.pack(pady=(0, 10))
+        
+        tk.Label(form, text="Phone (optional):", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        phone_entry = tk.Entry(form, bg='#2f2f2f', fg='white',
+                              insertbackground='white', font=('Arial', 12),
+                              width=30, bd=0, highlightthickness=1,
+                              highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        phone_entry.pack(pady=(0, 20))
+        
+        def save_contact():
+            name = name_entry.get().strip()
+            username = username_entry.get().strip()
+            phone = phone_entry.get().strip()
+            
+            if not name:
+                messagebox.showerror("Error", "Please enter a name")
+                return
+            
+            if not username:
+                # Generate username from name
+                username = name.lower().replace(' ', '_') + str(random.randint(100, 999))
+            
+            # Create contact
+            contact = {
+                'id': f"contact_{int(time.time())}_{random.randint(1000, 9999)}",
+                'name': name,
+                'username': username,
+                'phone': phone,
+                'avatar': self.get_random_avatar(),
+                'color': self.get_random_color()
             }
-            self.update_transfers_display()
             
-            # Send acceptance
-            if from_id in self.connected_users:
-                response = json.dumps({
-                    'type': 'file_accept',
-                    'transfer_id': transfer_id
-                })
-                self.connected_users[from_id].send(response.encode('utf-8'))
-            
+            self.contacts.append(contact)
+            self.save_contacts()
+            self.show_contacts()  # Refresh contacts view
             dialog.destroy()
-            self.add_chat_message(f"Accepting file: {filename}", "system")
-        
-        def reject_file():
-            # Send rejection
-            if from_id in self.connected_users:
-                response = json.dumps({
-                    'type': 'file_reject',
-                    'transfer_id': transfer_id
-                })
-                self.connected_users[from_id].send(response.encode('utf-8'))
             
-            dialog.destroy()
-            self.add_chat_message(f"Rejected file: {filename}", "system")
+            messagebox.showinfo("Success", f"Contact {name} added successfully!")
         
-        accept_btn = tk.Button(
-            button_frame,
-            text="✓ Accept",
-            font=('Arial', 11, 'bold'),
-            fg='white',
-            bg='#4CAF50',
-            command=accept_file,
-            width=10
-        )
-        accept_btn.pack(side='left', padx=10)
+        # Buttons
+        btn_frame = tk.Frame(form, bg='#1f1f1f')
+        btn_frame.pack(fill='x', pady=(10, 0))
         
-        reject_btn = tk.Button(
-            button_frame,
-            text="✗ Reject",
-            font=('Arial', 11),
-            fg='white',
-            bg='#F44336',
-            command=reject_file,
-            width=10
-        )
-        reject_btn.pack(side='left', padx=10)
+        tk.Button(btn_frame, text="Cancel", bg='#2f2f2f', fg='white',
+                 font=('Arial', 11), padx=20, command=dialog.destroy).pack(side='left', padx=5)
         
-        # Auto-reject after 30 seconds
-        def auto_reject():
-            if dialog.winfo_exists():
-                reject_file()
-        
-        dialog.after(30000, auto_reject)
+        tk.Button(btn_frame, text="Save", bg=self.theme_color, fg='white',
+                 font=('Arial', 11), padx=20, command=save_contact).pack(side='right', padx=5)
     
-    def remove_connection(self, sock):
-        """Remove a connection"""
-        user_id_to_remove = None
-        for user_id, user_sock in self.connected_users.items():
-            if user_sock == sock:
-                user_id_to_remove = user_id
+    def message_contact(self, contact):
+        """Start chat with contact"""
+        # Check if it's the saved messages (special case)
+        if isinstance(contact, dict) and contact.get('name') == 'Saved Messages':
+            self.open_saved_messages()
+            return
+        
+        # Check if chat exists
+        for chat in self.chats:
+            if isinstance(contact, dict) and chat.get('id') == contact.get('id'):
+                self.open_chat(chat)
+                return
+        
+        # Create new chat
+        if isinstance(contact, dict):
+            new_chat = {
+                'id': contact.get('id', f"contact_{int(time.time())}"),
+                'name': contact['name'],
+                'last_message': 'Start messaging',
+                'time': 'now',
+                'avatar': contact.get('avatar', '👤'),
+                'color': contact.get('color', self.get_random_color())
+            }
+            self.chats.append(new_chat)
+            self.save_chats()
+            self.refresh_chat_list()
+            self.show_chats()
+            self.open_chat(new_chat)
+    
+    def get_random_avatar(self):
+        """Get random avatar"""
+        avatars = ['👤', '👥', '👨', '👩', '👶', '🧑', '🐱', '🐶', '🐼', '🦊']
+        return random.choice(avatars)
+    
+    def get_random_color(self):
+        """Get random color"""
+        colors = ['#2b5278', '#8e6b3c', '#4a6da8', '#2e7d32', '#c44536', '#7b1fa2', '#00897b', '#f57c00']
+        return random.choice(colors)
+    
+    # ==================== MENU ====================
+    
+    def toggle_menu(self):
+        """Toggle menu sidebar"""
+        if self.menu_visible:
+            self.close_menu()
+        else:
+            self.show_menu()
+    
+    def show_menu(self):
+        """Show menu"""
+        self.menu_visible = True
+        
+        self.menu_window = tk.Toplevel(self.root)
+        self.menu_window.title("")
+        self.menu_window.geometry("250x600")
+        self.menu_window.configure(bg='#1f1f1f')
+        self.menu_window.overrideredirect(True)
+        
+        x = self.root.winfo_x() + 10
+        y = self.root.winfo_y() + 70
+        self.menu_window.geometry(f"+{x}+{y}")
+        
+        frame = tk.Frame(self.menu_window, bg='#1f1f1f')
+        frame.pack(fill='both', expand=True)
+        
+        # User info
+        user = tk.Frame(frame, bg='#2f2f2f', height=80)
+        user.pack(fill='x')
+        user.pack_propagate(False)
+        
+        avatar = tk.Frame(user, bg=self.theme_color, width=50, height=50)
+        avatar.pack(side='left', padx=15, pady=15)
+        avatar.pack_propagate(False)
+        
+        first = self.display_name[0].upper() if self.display_name else "👤"
+        tk.Label(avatar, text=first, bg=self.theme_color, fg='white',
+                font=('Arial', 20)).pack(expand=True)
+        
+        name_frame = tk.Frame(user, bg='#2f2f2f')
+        name_frame.pack(side='left', fill='both', expand=True, pady=15)
+        
+        tk.Label(name_frame, text=self.display_name, bg='#2f2f2f', fg='white',
+                font=('Arial', 14, 'bold')).pack(anchor='w')
+        
+        tk.Button(name_frame, text="Set Emoji Status", bg='#2f2f2f', fg='#888',
+                 font=('Arial', 10), bd=0, anchor='w').pack(anchor='w')
+        
+        # Separator
+        sep1 = tk.Frame(frame, bg='#2f2f2f', height=1)
+        sep1.pack(fill='x', pady=5)
+        
+        # Menu items
+        items = [
+            ("New Contact", "👤➕", self.add_new_contact),
+            ("New Group", "👥", self.new_group),
+            ("New Channel", "📢", self.new_channel),
+            ("Contacts", "📇", self.show_contacts_tab),
+            ("Calls", "📞", self.open_calls),
+            ("Saved Messages", "📌", self.open_saved_messages),
+            ("Settings", "⚙️", self.open_settings),
+            ("Night Mode", "🌙", self.toggle_night_mode)
+        ]
+        
+        for text, icon, cmd in items:
+            btn = tk.Button(frame, text=f"  {icon}  {text}", bg='#1f1f1f', fg='white',
+                          font=('Arial', 12), bd=0, anchor='w', padx=20, pady=10,
+                          activebackground='#2f2f2f', command=cmd)
+            btn.pack(fill='x')
+        
+        # Separator
+        sep2 = tk.Frame(frame, bg='#2f2f2f', height=1)
+        sep2.pack(fill='x', pady=5)
+        
+        # My Profile at bottom
+        profile_btn = tk.Button(frame, text="  👤  My Profile", bg='#1f1f1f', fg='white',
+                               font=('Arial', 12), bd=0, anchor='w', padx=20, pady=10,
+                               activebackground='#2f2f2f', command=self.open_profile)
+        profile_btn.pack(fill='x', side='bottom')
+        
+        self.menu_window.bind('<FocusOut>', lambda e: self.close_menu())
+    
+    def close_menu(self):
+        """Close menu"""
+        self.menu_visible = False
+        if self.menu_window:
+            self.menu_window.destroy()
+    
+    # ==================== MENU ACTIONS ====================
+    
+    def open_profile(self):
+        """Open profile window"""
+        self.close_menu()
+        
+        profile = tk.Toplevel(self.root)
+        profile.title("Profile")
+        profile.geometry("350x500")
+        profile.configure(bg='#0f0f0f')
+        
+        # Content
+        main = tk.Frame(profile, bg='#1f1f1f', padx=30, pady=30)
+        main.pack(expand=True, fill='both', padx=20, pady=20)
+        
+        # Avatar
+        avatar_frame = tk.Frame(main, bg=self.theme_color, width=100, height=100)
+        avatar_frame.pack(pady=(0, 20))
+        avatar_frame.pack_propagate(False)
+        
+        first = self.display_name[0].upper() if self.display_name else "👤"
+        tk.Label(avatar_frame, text=first, bg=self.theme_color, fg='white',
+                font=('Arial', 40)).pack(expand=True)
+        
+        tk.Button(main, text="Change Photo", bg='#2f2f2f', fg='white',
+                 font=('Arial', 11), command=self.change_photo).pack(pady=5)
+        
+        # Info
+        info_frame = tk.Frame(main, bg='#1f1f1f')
+        info_frame.pack(fill='x', pady=10)
+        
+        tk.Label(info_frame, text="Name", bg='#1f1f1f', fg='#888',
+                font=('Arial', 10)).pack(anchor='w')
+        tk.Label(info_frame, text=self.display_name, bg='#1f1f1f', fg='white',
+                font=('Arial', 14)).pack(anchor='w', pady=(0, 10))
+        
+        tk.Label(info_frame, text="Username", bg='#1f1f1f', fg='#888',
+                font=('Arial', 10)).pack(anchor='w')
+        tk.Label(info_frame, text=f"@{self.username}", bg='#1f1f1f', fg='white',
+                font=('Arial', 14)).pack(anchor='w', pady=(0, 10))
+        
+        tk.Label(info_frame, text="Phone", bg='#1f1f1f', fg='#888',
+                font=('Arial', 10)).pack(anchor='w')
+        tk.Label(info_frame, text=self.phone or "Not set", bg='#1f1f1f', fg='white',
+                font=('Arial', 14)).pack(anchor='w', pady=(0, 10))
+        
+        tk.Label(info_frame, text="Bio", bg='#1f1f1f', fg='#888',
+                font=('Arial', 10)).pack(anchor='w')
+        
+        bio_entry = tk.Text(info_frame, bg='#2f2f2f', fg='white',
+                           font=('Arial', 11), height=4, width=30)
+        bio_entry.pack(anchor='w', pady=(0, 10))
+        bio_entry.insert('1.0', self.bio)
+        
+        def save_bio():
+            self.bio = bio_entry.get('1.0', 'end-1c').strip()
+            self.save_user_data()
+            messagebox.showinfo("Success", "Bio updated")
+        
+        tk.Button(info_frame, text="Save Bio", bg=self.theme_color, fg='white',
+                 font=('Arial', 11), command=save_bio).pack()
+    
+    def change_photo(self):
+        """Change profile photo"""
+        filename = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg")])
+        if filename:
+            dest = os.path.join(self.data_dir, "profile_photo.png")
+            shutil.copy2(filename, dest)
+            self.profile_photo = dest
+            messagebox.showinfo("Success", "Profile photo updated")
+    
+    def new_group(self):
+        """Create new group"""
+        self.close_menu()
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("New Group")
+        dialog.geometry("350x300")
+        dialog.configure(bg='#1f1f1f')
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (350 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (300 // 2)
+        dialog.geometry(f"+{x}+{y}")
+        
+        # Form
+        form = tk.Frame(dialog, bg='#1f1f1f', padx=20, pady=20)
+        form.pack(fill='both', expand=True)
+        
+        tk.Label(form, text="Create New Group", bg='#1f1f1f', fg='white',
+                font=('Arial', 16, 'bold')).pack(pady=(0, 20))
+        
+        tk.Label(form, text="Group Name:", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        name_entry = tk.Entry(form, bg='#2f2f2f', fg='white',
+                             insertbackground='white', font=('Arial', 12),
+                             width=30, bd=0, highlightthickness=1,
+                             highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        name_entry.pack(pady=(0, 15))
+        name_entry.focus_set()
+        
+        tk.Label(form, text="Select Members (from contacts):", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        # Contact selection listbox
+        list_frame = tk.Frame(form, bg='#2f2f2f')
+        list_frame.pack(fill='both', expand=True, pady=(0, 15))
+        
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side='right', fill='y')
+        
+        contacts_list = tk.Listbox(list_frame, bg='#2f2f2f', fg='white',
+                                   selectmode='multiple', yscrollcommand=scrollbar.set,
+                                   font=('Arial', 11), height=5)
+        contacts_list.pack(side='left', fill='both', expand=True)
+        
+        scrollbar.config(command=contacts_list.yview)
+        
+        # Populate contacts
+        if self.contacts:
+            for contact in self.contacts:
+                contacts_list.insert(tk.END, f"{contact['name']} (@{contact['username']})")
+        else:
+            contacts_list.insert(tk.END, "No contacts available")
+            contacts_list.config(state='disabled')
+        
+        def create_group():
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Please enter a group name")
+                return
+            
+            # Get selected contacts
+            selected_indices = contacts_list.curselection()
+            selected_contacts = []
+            for idx in selected_indices:
+                if idx < len(self.contacts):
+                    selected_contacts.append(self.contacts[idx])
+            
+            # Create group chat
+            chat_id = f"group_{int(time.time())}"
+            group_chat = {
+                'id': chat_id,
+                'name': name,
+                'last_message': 'Group created',
+                'time': 'now',
+                'avatar': '👥',
+                'color': self.get_random_color(),
+                'is_group': True,
+                'members': [self.user_id] + [c.get('id') for c in selected_contacts],
+                'member_names': [self.display_name] + [c['name'] for c in selected_contacts]
+            }
+            
+            self.chats.append(group_chat)
+            self.save_chats()
+            self.refresh_chat_list()
+            self.show_chats()
+            
+            # Add welcome message
+            if chat_id not in self.messages:
+                self.messages[chat_id] = []
+            
+            welcome_msg = {
+                'text': f"Group '{name}' created with {len(selected_contacts)} members",
+                'sent': True,
+                'time': time.time(),
+                'sender': self.display_name,
+                'system': True
+            }
+            self.messages[chat_id].append(welcome_msg)
+            self.save_messages()
+            
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Group '{name}' created successfully!")
+            self.open_chat(group_chat)
+        
+        # Buttons
+        btn_frame = tk.Frame(form, bg='#1f1f1f')
+        btn_frame.pack(fill='x', pady=(10, 0))
+        
+        tk.Button(btn_frame, text="Cancel", bg='#2f2f2f', fg='white',
+                 font=('Arial', 11), padx=20, command=dialog.destroy).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="Create", bg=self.theme_color, fg='white',
+                 font=('Arial', 11), padx=20, command=create_group).pack(side='right', padx=5)
+    
+    def new_channel(self):
+        """Create new channel"""
+        self.close_menu()
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("New Channel")
+        dialog.geometry("350x250")
+        dialog.configure(bg='#1f1f1f')
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (350 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (250 // 2)
+        dialog.geometry(f"+{x}+{y}")
+        
+        # Form
+        form = tk.Frame(dialog, bg='#1f1f1f', padx=20, pady=20)
+        form.pack(fill='both', expand=True)
+        
+        tk.Label(form, text="Create New Channel", bg='#1f1f1f', fg='white',
+                font=('Arial', 16, 'bold')).pack(pady=(0, 20))
+        
+        tk.Label(form, text="Channel Name:", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        name_entry = tk.Entry(form, bg='#2f2f2f', fg='white',
+                             insertbackground='white', font=('Arial', 12),
+                             width=30, bd=0, highlightthickness=1,
+                             highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        name_entry.pack(pady=(0, 15))
+        name_entry.focus_set()
+        
+        tk.Label(form, text="Description (optional):", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w', pady=(0, 5))
+        
+        desc_entry = tk.Entry(form, bg='#2f2f2f', fg='white',
+                             insertbackground='white', font=('Arial', 12),
+                             width=30, bd=0, highlightthickness=1,
+                             highlightcolor=self.theme_color, highlightbackground='#3f3f3f')
+        desc_entry.pack(pady=(0, 20))
+        
+        def create_channel():
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Please enter a channel name")
+                return
+            
+            description = desc_entry.get().strip()
+            
+            # Create channel chat
+            chat_id = f"channel_{int(time.time())}"
+            channel_chat = {
+                'id': chat_id,
+                'name': name,
+                'last_message': 'Channel created',
+                'time': 'now',
+                'avatar': '📢',
+                'color': self.get_random_color(),
+                'is_channel': True,
+                'description': description,
+                'subscribers': [self.user_id]
+            }
+            
+            self.chats.append(channel_chat)
+            self.save_chats()
+            self.refresh_chat_list()
+            self.show_chats()
+            
+            # Add welcome message
+            if chat_id not in self.messages:
+                self.messages[chat_id] = []
+            
+            welcome_msg = {
+                'text': f"Channel '{name}' created. This is your channel. Share it with others!",
+                'sent': True,
+                'time': time.time(),
+                'sender': self.display_name,
+                'system': True
+            }
+            self.messages[chat_id].append(welcome_msg)
+            self.save_messages()
+            
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Channel '{name}' created successfully!")
+            self.open_chat(channel_chat)
+        
+        # Buttons
+        btn_frame = tk.Frame(form, bg='#1f1f1f')
+        btn_frame.pack(fill='x', pady=(10, 0))
+        
+        tk.Button(btn_frame, text="Cancel", bg='#2f2f2f', fg='white',
+                 font=('Arial', 11), padx=20, command=dialog.destroy).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="Create", bg=self.theme_color, fg='white',
+                 font=('Arial', 11), padx=20, command=create_channel).pack(side='right', padx=5)
+    
+    def show_contacts_tab(self):
+        """Show contacts tab"""
+        self.close_menu()
+        self.show_contacts()
+    
+    def open_calls(self):
+        """Open calls"""
+        self.close_menu()
+        
+        calls = tk.Toplevel(self.root)
+        calls.title("Calls")
+        calls.geometry("350x400")
+        calls.configure(bg='#1f1f1f')
+        
+        tk.Label(calls, text="Recent Calls", bg='#1f1f1f', fg='white',
+                font=('Arial', 16, 'bold')).pack(pady=10)
+        
+        # Sample calls
+        calls_list = [
+            ("Mom", "📞", "#4a6da8", "Today, 10:30"),
+            ("Alex", "👤", "#2e7d32", "Yesterday, 18:45"),
+            ("Work Group", "👥", "#c44536", "2 days ago"),
+        ]
+        
+        for name, icon, color, time in calls_list:
+            frame = tk.Frame(calls, bg='#1f1f1f')
+            frame.pack(fill='x', padx=10, pady=2)
+            
+            avatar = tk.Frame(frame, bg=color, width=40, height=40)
+            avatar.pack(side='left', padx=5, pady=5)
+            avatar.pack_propagate(False)
+            tk.Label(avatar, text=icon, bg=color, fg='white',
+                    font=('Arial', 16)).pack(expand=True)
+            
+            tk.Label(frame, text=name, bg='#1f1f1f', fg='white',
+                    font=('Arial', 12)).pack(side='left', padx=10)
+            
+            tk.Label(frame, text=time, bg='#1f1f1f', fg='#888',
+                    font=('Arial', 10)).pack(side='right', padx=10)
+    
+    def open_saved_messages(self):
+        """Open saved messages"""
+        self.close_menu()
+        
+        # Find saved messages chat
+        saved_chat = None
+        for chat in self.chats:
+            if chat.get('id') == 'saved':
+                saved_chat = chat
                 break
         
-        if user_id_to_remove:
-            del self.connected_users[user_id_to_remove]
-            
-            if user_id_to_remove in self.user_directory:
-                self.user_directory[user_id_to_remove]['is_online'] = False
-            
-            self.root.after(0, self.update_contacts_list)
-            self.root.after(0, self.add_chat_message,
-                          f"User disconnected", "system")
+        if not saved_chat:
+            # Create saved messages if it doesn't exist
+            saved_chat = {
+                'id': 'saved',
+                'name': 'Saved Messages',
+                'last_message': 'Your notes and media',
+                'time': 'now',
+                'avatar': '📌',
+                'color': '#fbc02d',
+                'pinned': True
+            }
+            self.chats.insert(0, saved_chat)  # Insert at beginning
+            self.save_chats()
+            self.refresh_chat_list()
         
-        try:
-            sock.close()
-        except:
-            pass
+        self.open_chat(saved_chat)
     
-    def on_closing(self):
-        """Clean shutdown"""
-        self.messenger_active = False
+    def open_settings(self):
+        """Open settings window"""
+        self.close_menu()
         
-        # Close all connections
-        for sock in self.connected_users.values():
-            try:
-                sock.close()
-            except:
-                pass
+        settings = tk.Toplevel(self.root)
+        settings.title("Settings")
+        settings.geometry("500x600")
+        settings.configure(bg='#0f0f0f')
         
-        if self.messenger_server:
-            try:
-                self.messenger_server.close()
-            except:
-                pass
+        # Header
+        header = tk.Frame(settings, bg='#1f1f1f', height=50)
+        header.pack(fill='x')
+        tk.Label(header, text="Settings", bg='#1f1f1f', fg='white',
+                font=('Arial', 14, 'bold')).pack(pady=10)
         
-        if self.file_server:
-            try:
-                self.file_server.close()
-            except:
-                pass
+        # Content
+        canvas = tk.Canvas(settings, bg='#0f0f0f', highlightthickness=0)
+        scroll = tk.Scrollbar(settings, orient='vertical', command=canvas.yview)
+        scrollable = tk.Frame(canvas, bg='#0f0f0f')
         
-        self.root.destroy()
-        sys.exit(0)
+        scrollable.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=scrollable, anchor='nw')
+        canvas.configure(yscrollcommand=scroll.set)
+        
+        canvas.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+        
+        # Profile preview
+        profile = tk.Frame(scrollable, bg='#1f1f1f')
+        profile.pack(fill='x', padx=10, pady=10)
+        
+        tk.Label(profile, text="Profile", bg='#1f1f1f', fg='white',
+                font=('Arial', 12, 'bold')).pack(anchor='w', padx=15, pady=(10, 5))
+        
+        prof_row = tk.Frame(profile, bg='#1f1f1f')
+        prof_row.pack(fill='x', padx=15, pady=10)
+        
+        avatar = tk.Frame(prof_row, bg=self.theme_color, width=50, height=50)
+        avatar.pack(side='left')
+        avatar.pack_propagate(False)
+        tk.Label(avatar, text=self.display_name[0].upper(), bg=self.theme_color,
+                fg='white', font=('Arial', 20)).pack(expand=True)
+        
+        info = tk.Frame(prof_row, bg='#1f1f1f', padx=10)
+        info.pack(side='left', fill='both', expand=True)
+        tk.Label(info, text=self.display_name, bg='#1f1f1f', fg='white',
+                font=('Arial', 14)).pack(anchor='w')
+        tk.Label(info, text=f"@{self.username}", bg='#1f1f1f', fg='#888',
+                font=('Arial', 11)).pack(anchor='w')
+        
+        # Settings sections
+        sections = [
+            ("Notifications", "🔔", "notifications"),
+            ("Privacy", "🔒", None),
+            ("Data", "📊", None),
+            ("Chat Settings", "💬", None),
+            ("Theme", "🎨", "theme"),
+            ("Language", "🌐", None),
+            ("Storage", "💾", None)
+        ]
+        
+        for label, icon, var in sections:
+            section = tk.Frame(scrollable, bg='#1f1f1f')
+            section.pack(fill='x', padx=10, pady=2)
+            
+            row = tk.Frame(section, bg='#1f1f1f')
+            row.pack(fill='x', padx=15, pady=12)
+            
+            tk.Label(row, text=f"{icon}  {label}", bg='#1f1f1f', fg='white',
+                    font=('Arial', 12)).pack(side='left')
+            
+            if var == 'notifications':
+                var = tk.BooleanVar(value=self.notifications)
+                cb = tk.Checkbutton(row, bg='#1f1f1f', variable=var,
+                                   command=lambda: self.toggle_notifications(var))
+                cb.pack(side='right')
+            elif var == 'theme':
+                colors = ['#4a6da8', '#c44536', '#2e7d32', '#8e6b3c', '#7b1fa2']
+                color_frame = tk.Frame(row, bg='#1f1f1f')
+                color_frame.pack(side='right')
+                
+                for color in colors:
+                    btn = tk.Button(color_frame, bg=color, width=2, height=1,
+                                   command=lambda c=color: self.change_theme(c))
+                    btn.pack(side='left', padx=2)
+    
+    def toggle_notifications(self, var):
+        """Toggle notifications"""
+        self.notifications = var.get()
+        self.save_user_data()
+    
+    def change_theme(self, color):
+        """Change theme color"""
+        self.theme_color = color
+        self.save_user_data()
+        messagebox.showinfo("Theme", "Theme changed. Restart to see changes.")
+    
+    def toggle_night_mode(self):
+        """Toggle night mode"""
+        self.close_menu()
+        self.night_mode = not self.night_mode
+        if self.night_mode:
+            self.root.configure(bg='#0f0f0f')
+            messagebox.showinfo("Night Mode", "Dark mode activated")
+        else:
+            self.root.configure(bg='#ffffff')
+            messagebox.showinfo("Night Mode", "Light mode activated")
+    
+    # ==================== UTILITIES ====================
+    
+    def clear_search_placeholder(self, e):
+        if self.search_entry.get() == "Search":
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.config(fg='white')
+    
+    def restore_search_placeholder(self, e):
+        if not self.search_entry.get():
+            self.search_entry.insert(0, "Search")
+            self.search_entry.config(fg='#888')
+    
+    def search_chats(self, e):
+        term = self.search_entry.get().lower()
+        if term == "search":
+            return
+        
+        for widget in self.chat_scrollable.winfo_children():
+            if hasattr(widget, 'chat_id'):
+                chat = next((c for c in self.chats if c.get('id') == widget.chat_id), None)
+                if chat and (term in chat['name'].lower() or term in chat['last_message'].lower()):
+                    widget.pack(fill='x', pady=1)
+                else:
+                    widget.pack_forget()
     
     def run(self):
         """Run the application"""
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.mainloop()
 
-def main():
-    # Hide console on Windows (only if not frozen as exe)
-    if platform.system() == "Windows" and not getattr(sys, 'frozen', False):
-        try:
-            import ctypes
-            whnd = ctypes.windll.kernel32.GetConsoleWindow()
-            if whnd != 0:
-                ctypes.windll.user32.ShowWindow(whnd, 0)
-        except:
-            pass
-    
-    app = LocalMessenger()
-    app.run()
-
 if __name__ == "__main__":
-    main()
+    app = TelegramStyleMessenger()
+    app.run()
